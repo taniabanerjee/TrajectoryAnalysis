@@ -7,13 +7,12 @@ from pathlib import Path
 import glob
 import os
 import csv
-from hash import HashTable
 import copy
 
-df = pd.read_csv('outputclass.csv')
+df = pd.read_csv('../DataFiles/outputclass.csv')
 columns = ['track_id', 'x', 'y', 'class', 'timestamp']
 
-spatdf=pd.read_csv('SPAT.csv',names=['timestamp', 'hexphase', 'binphase', 'redphase', 'cyclenumber'], index_col='timestamp')
+spatdf=pd.read_csv('../DataFiles/SPAT.csv',names=['timestamp', 'hexphase', 'binphase', 'redphase', 'cyclenumber'], index_col='timestamp')
 
 ndf = df.copy(True)
 
@@ -41,5 +40,5 @@ ndf['SPAT'] = plist
 ndf['RedStatus'] = rlist
 print (ndf)
 
-ndf.to_csv('combo.csv', index=False)
+ndf.to_csv('../DataFiles/combo.csv', index=False)
 

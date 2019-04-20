@@ -1,5 +1,0 @@
-mysql -h trafficdatarepo.cc8u1njcqcdl.us-east-2.rds.amazonaws.com -P 3306 -u dhruv -p
-CREATE TABLE IF NOT EXISTS DisplayInfo(frame_id INT, track_id INT, center_x FLOAT, center_y FLOAT, class varchar(20), timestamp DATETIME, intersection_id INT, SPAT varchar(6), Cycle INT, speed_x FLOAT, speed_y FLOAT, Cluster INT, isAnomalous INT);
-/usr/local/mysql/bin/mysqlimport --local --compress --user=dhruv --password --host=trafficdatarepo.cc8u1njcqcdl.us-east-2.rds.amazonaws.com --lines-terminated-by='\n' --fields-terminated-by=',' --ignore-lines=1 testdb DisplayInfo.csv;
-select distinct(SPAT) from DisplayInfo;
-

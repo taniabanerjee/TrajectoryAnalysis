@@ -9,11 +9,11 @@ import os
 import csv
 import copy
 
-df = pd.read_csv('outputclass.csv')
+df = pd.read_csv('../DataFiles/outputclass.csv')
 columns = ['track_id', 'x', 'y', 'class', 'timestamp']
 
-spatdf=pd.read_csv('SPAT.csv',names=['timestamp', 'hexphase', 'binphase', 'redphase', 'cyclenumber'], index_col='timestamp')
-clusdf=pd.read_csv('cluster.csv',names=['track_id','cluster','phase','class','isAnomalous'], index_col='track_id')
+spatdf=pd.read_csv('../DataFiles/SPAT.csv',names=['timestamp', 'hexphase', 'binphase', 'redphase', 'cyclenumber'], index_col='timestamp')
+clusdf=pd.read_csv('../DataFiles/cluster.csv',names=['track_id','cluster','phase','class','isAnomalous'], index_col='track_id')
 
 ndf = df.copy(True)
 plist = []
@@ -92,5 +92,5 @@ ndf['isAnomalous'] = alist
 
 print (ndf)
 
-ndf.to_csv('display.csv', index=False)
+ndf.to_csv('../DataFiles/DisplayInfo.csv', index=False)
 

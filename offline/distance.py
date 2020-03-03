@@ -3,12 +3,14 @@ import pandas as pd
 import math
 import sys
 import datetime
-from pathlib import Path
 import glob
 import os
 import csv
 import copy
 import pymysql
+import time
+import random
+from pathlib import Path
 from sklearn.neighbors import KDTree
 from rdp import rdp
 from shapely.geometry import Point, Polygon
@@ -17,11 +19,12 @@ from sklearn.preprocessing import PolynomialFeatures
 from sklearn.cluster import KMeans
 from ast import literal_eval
 from hash import HashTable
-import time
 from scipy.sparse import dok_matrix
 from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
 from sqlalchemy import create_engine
+from collections import namedtuple
+from operator import itemgetter, attrgetter
 
 if (len(sys.argv) == 1):
         print ('Error: provide config file')
@@ -46,6 +49,34 @@ with open(filepath) as fp:
    while (line):
        line = extractOptions(fp)
 
+def movingaverage(values, window):
+    weights = np.repeat(1.0, window)/window
+    smas = np.convolve(values, weights, 'valid')
+    return smas
+
+def ExpMovingAverage(values, window):
+    weights = np.exp(np.linspace(-1., 0., window))
+    weights /= weights.sum()
+    a = np.convolve(values, weights, mode='full')[:len(values)]
+    a[:window] = a[window]
+    return a
+
+del_file = options['clusterf']
+if (os.path.isfile(del_file)):
+    os.remove(del_file)
+
+display_file = options['display']
+if (os.path.isfile(display_file)):
+    os.remove(display_file)
+
+#real_displayfile = options['onlinedisplay']
+#if (os.path.isfile(real_displayfile)):
+#    os.remove(real_displayfile)
+#
+#trackprop_file = options['trackprop']
+#if (os.path.isfile(trackprop_file)):
+#    os.remove(trackprop_file)
+#
 directions = {}
 directions['NS'] = literal_eval(options['NS'])
 directions['SN'] = literal_eval(options['SN'])
@@ -98,6 +129,8 @@ class Track:
         self.rrange = rrange
         self.x = x
         self.arr = y
+        self.origx = x
+        self.origy = y
         self.t = np.empty(shape=rrange)
         self.ts = np.empty(shape=rrange)
         self.f = np.empty(shape=rrange)
@@ -115,6 +148,12 @@ class Track:
         self.iid = 0
         self.clus = ''
         self.iscent = 0
+        self.nm=0
+        self.sig=0
+        self.uid=0
+        self.sx = np.empty(shape=rrange)
+        self.sy = np.empty(shape=rrange)
+        self.ignore = 0
 
 pd.set_option('display.max_rows', 500)
 pd.set_option('display.max_columns', 500)
@@ -145,9 +184,9 @@ def main():
     deletequery='delete from CentroidsTable where intersection_id=name1 and camera_id=name2;'
     deletequery=deletequery.replace("name1", options['cityintid'])
     deletequery=deletequery.replace("name2", options['cameraid'])
-    writequery='insert into CentroidsTable (track_id, x, y, class, camera_id, intersection_id, phase, name) values (%s, %s, %s, %s, %s, %s, %s, %s)'
-    querylimit = 'select time,frame_id,track_id,center_x,center_y,class,timestamp,intersection_id,nearmiss,signature from OnlineTrackInfo where timestamp between %(name2)s and %(name3)s and intersection_id=%(name)s;'
-    spatquery = 'select timestamp,hexphase,cycle from OnlineSPaT where timestamp between %(name2)s and %(name3)s and intersection_id=%(name)s;'
+    writequery='insert into CentroidsTable (track_id, x, y, class, camera_id, intersection_id, phase, name, ordering) values (%s, %s, %s, %s, %s, %s, %s, %s, %s)'
+    querylimit = 'select time,frame_id,track_id,center_x,center_y,class,timestamp,intersection_id,nearmiss,signature,unique_ID from OnlineTrackInfo where timestamp between %(name2)s and %(name3)s and intersection_id=%(name)s;'
+    spatquery = 'select timestamp,hexphase,cycle,type from OnlineSPaT where timestamp between %(name2)s and %(name3)s and intersection_id=%(name)s;'
 
     start = time.time()
     cindex = 4
@@ -156,334 +195,621 @@ def main():
     maxtrackid = -10000
     stime = pd.to_datetime(options['start'])
     ftime = stime + datetime.timedelta(minutes=int(options['collecttime']))
-    etime = pd.to_datetime(options['end'])-datetime.timedelta(minutes=int(options['collecttime']))
+    #etime = pd.to_datetime(options['end'])-datetime.timedelta(minutes=int(options['collecttime']))+datetime.timedelta(minutes=1)
+    etime = pd.to_datetime(options['end'])
     ctime = stime + datetime.timedelta(minutes=1) #replace with now
     interval = datetime.timedelta(minutes=int(options['clusterinterval']))
     endctime = ctime + interval
-    while (ctime < etime):
-        #sleep for (ftime - ctime)
-        while (ctime < ftime):
-            #wait for a minute
-            ctime = ctime + datetime.timedelta(minutes=1)
-        df = pd.read_sql(querylimit, myinputdb, params={'name' : options['cameraid'], 'name2' : stime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : ftime.strftime("%Y-%m-%d %H:%M:%S.%f")})
-        spatdf = pd.read_sql(spatquery, myoutputdb, params={'name' : options['cityintid'], 'name2' : stime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : ftime.strftime("%Y-%m-%d %H:%M:%S.%f")})
-        #df = pd.read_csv(options['combo'])
-        tracks = df['track_id'].unique()
-        objects = options['objects'].split(',')
-        phases = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        gtracks = [[[] for j in range(len(phases))] for i in range(len(objects))]
-        ntrackobj = np.zeros(shape=(len(objects),len(phases)))
-    
-        p=0
-        excluded_car_tracks = []
-        excluded_ped_tracks = []
-        track_with_two_points = []
-        blobs = []
-        track_with_length_greater_than_1350 = []
-        track_with_length_greater_than_2000 = []
-        high_speed_ped_track_200 = []
-        low_speed_veh_track_150 = []
-        track_with_length_smaller_than_200 = []
-        track_with_length_smaller_than_150_after_zoning = []
-        high_speed_ped_track_130 = []
-        low_speed_veh_track_100 = []
-        tweezer_track = []
-        tracklist = []
-        lenlist = []
-        speedlist = []
-        isvehlist = []
-        car_bb=[]
-        bus_bb=[]
-        motorbike_bb=[]
-        ped_bb=[]
-        car_ratio=[]
-        bus_ratio=[]
-        motorbike_ratio=[]
-        ped_ratio=[]
-        new_ped=[]
-        new_motorbike=[]
-        signal_violate=[]
-        track_shape=[]
-        track_lane_change=[]
-        weird_shape=[]
-    
-        nummixedphases = 0
-        pedindex = -1
-        if ('pedestrian' in objects):
-            pedindex = objects.index('pedestrian')
+    #while (ctime <= etime):
+    df = pd.read_sql(querylimit, myinputdb, params={'name' : options['cameraid'], 'name2' : stime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : etime.strftime("%Y-%m-%d %H:%M:%S.%f")})
+    spatdf = pd.read_sql(spatquery, myoutputdb, params={'name' : options['cityintid'], 'name2' : stime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : etime.strftime("%Y-%m-%d %H:%M:%S.%f")})
+    #df = pd.read_csv(options['combo'])
+    tracks = df['track_id'].unique()
+    objects = options['objects'].split(',')
+    phases = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    gtracks = [[[] for j in range(len(phases))] for i in range(len(objects))]
+    ntrackobj = np.zeros(shape=(len(objects),len(phases)))
+
+    p=0
+    excluded_car_tracks = []
+    excluded_ped_tracks = []
+    track_with_two_points = []
+    blobs = []
+    track_with_length_greater_than_1350 = []
+    track_with_length_greater_than_2000 = []
+    high_speed_ped_track_200 = []
+    low_speed_veh_track_150 = []
+    track_with_length_smaller_than_200 = []
+    track_with_length_smaller_than_150_after_zoning = []
+    high_speed_ped_track_130 = []
+    low_speed_veh_track_100 = []
+    tweezer_track = []
+    tracklist = []
+    lenlist = []
+    speedlist = []
+    isvehlist = []
+    car_bb=[]
+    bus_bb=[]
+    motorbike_bb=[]
+    ped_bb=[]
+    car_ratio=[]
+    bus_ratio=[]
+    motorbike_ratio=[]
+    ped_ratio=[]
+    new_ped=[]
+    new_motorbike=[]
+    signal_violate=[]
+    track_shape=[]
+    track_lane_change=[]
+    weird_shape=[]
+
+    nummixedphases = 0
+    pedindex = -1
+    if ('pedestrian' in objects):
+        pedindex = objects.index('pedestrian')
+    maxpathlength = float(options['pathlength'])
+    for tid in tracks:
+#querylimit = 'select time,frame_id,track_id,center_x,center_y,class,timestamp,intersection_id,nearmiss,signature,unique_ID from OnlineTrackInfo where timestamp between %(name2)s and %(name3)s and intersection_id=%(name)s;'
+        ndf = df.loc[df['track_id'] == tid]
+        t = ndf.iloc[:,0].values
+        f = ndf.iloc[:,1].values
+        nx = ndf.iloc[:,3].values
+        ny = ndf.iloc[:,4].values
+        c = ndf.iloc[:,5].values
+        ts = ndf.iloc[:,6].values
+        iid = ndf.iloc[:,7].values
+        nm = ndf.iloc[:,8].values
+        sig = ndf.iloc[:,9].values
+        uid = ndf.iloc[:,10].values
+        #nsx = ndf.iloc[:,8].values
+        #nsy = ndf.iloc[:,9].values
+        #rs = ndf.iloc[:,11].values #phases
+        #ps = ndf.iloc[:,11].values #phases
+        #cycle = ndf.iloc[:,12].values #cycle
+        si = 0
+        se = np.size(nx)
+        r = np.size(nx)
+        isPed = False
+        if (ts.size <= 2 ):
+            phaseindex = 0
+        else:
+            phaseindex = ts.size - 2
+
+        if (c[0]=='pedestrian'):
+            isPed = True
+        if (isPed == False):
+            vehspat = spatdf[spatdf['type']==1]
+            exactmatch = vehspat.iloc[np.searchsorted(vehspat.timestamp.values, ts[phaseindex]+(f[phaseindex]%10)*np.timedelta64(100,'ms')) - 1]
+        else:
+            pedspat = spatdf[spatdf['type']==0]
+            exactmatch = pedspat.iloc[np.searchsorted(pedspat.timestamp.values, ts[phaseindex]+(f[phaseindex]%10)*np.timedelta64(100,'ms')) - 1]
+
+        #exactmatch = spatdf.iloc[getSPaTIndex(spatdf, ts[r-2]+(f[r-2]%10)*np.timedelta64(100,'ms'))]
+        rs = exactmatch['hexphase']
+        cyclenum=exactmatch['cycle']
+        phasetype = rs
+
+        pathLength = getPathLength(tid, nx, ny)
+        if (pathLength < maxpathlength):
+            #print ("Ignored track of length < 159:", tid)
+            track_with_length_smaller_than_200.append(tid)
+            continue
+        cindex = objects.index(c[0])
+        #if (c[0] == 'pedestrian'):
+        if (cindex == pedindex):
+            excl, si, se = getRelevantCoordinates(pedpolygon, nx, ny, cindex==pedindex, tid)
+            if (excl):
+                excluded_ped_tracks.append(tid)
+                continue
+            x = nx[si:se]
+            y = ny[si:se]
+            t = t[si:se]
+            f = f[si:se]
+            ts = ts[si:se]
+        else:
+            excl, si, se = getRelevantCoordinates(polygon, nx, ny, cindex==pedindex, tid)
+            if (excl):
+                excluded_car_tracks.append(tid)
+                continue
+            x = nx[si:se]
+            y = ny[si:se]
+            t = t[si:se]
+            f = f[si:se]
+            ts = ts[si:se]
+        xlen = x.size
+        if (xlen < 4):
+            continue
+        pathLength = getPathLength(tid, x, y)
+        X = np.array([[x, y] for x, y in zip(x, y)])
+        e = 1
+        mask = rdp(X, epsilon=e, return_mask=True)
+        t = np.ma.compressed(np.ma.masked_where(mask==False, t))
+        f = np.ma.compressed(np.ma.masked_where(mask==False, f))
+        x = np.ma.compressed(np.ma.masked_where(mask==False, x))
+        y = np.ma.compressed(np.ma.masked_where(mask==False, y))
+        ts = np.ma.compressed(np.ma.masked_where(mask==False, ts))
+        x = movingaverage(x, 3)
+        y = movingaverage(y, 3)
+        ts = ts[2:]
+        t = t[2:]
+        f = f[2:]
+        pathLength = getPathLength(tid, x, y)
+        lengthH[tid] = pathLength
         maxpathlength = float(options['pathlength'])
-        for tid in tracks:
-            ndf = df.loc[df['track_id'] == tid]
-            t = ndf.iloc[:,0].values
-            f = ndf.iloc[:,1].values
-            nx = ndf.iloc[:,3].values
-            ny = ndf.iloc[:,4].values
-            c = ndf.iloc[:,5].values
-            ts = ndf.iloc[:,6].values
-            iid = ndf.iloc[:,7].values
-            #nsx = ndf.iloc[:,8].values
-            #nsy = ndf.iloc[:,9].values
-            #rs = ndf.iloc[:,11].values #phases
-            #ps = ndf.iloc[:,11].values #phases
-            #cycle = ndf.iloc[:,12].values #cycle
-            si = 0
-            se = np.size(nx)
-            r = np.size(nx)
-            exactmatch = spatdf.iloc[getSPaTIndex(spatdf, ts[r-2]+(f[r-2]%10)*np.timedelta64(100,'ms'))]
-            rs = exactmatch['hexphase']
-            cyclenum=exactmatch['cycle']
-            phasetype = rs
+        if (pathLength < maxpathlength):
+            continue
 
-            pathLength = getPathLength(tid, nx, ny)
-            if (pathLength < maxpathlength):
-                #print ("Ignored track of length < 159:", tid)
-                track_with_length_smaller_than_200.append(tid)
-                continue
-            cindex = objects.index(c[0])
-            #if (c[0] == 'pedestrian'):
-            if (cindex == pedindex):
-                excl, si, se = getRelevantCoordinates(pedpolygon, nx, ny, cindex==pedindex, tid)
-                if (excl):
-                    excluded_ped_tracks.append(tid)
-                    continue
-                x = nx[si:se]
-                y = ny[si:se]
-                t = t[si:se]
-                f = f[si:se]
-                ts = ts[si:se]
-            else:
-                excl, si, se = getRelevantCoordinates(polygon, nx, ny, cindex==pedindex, tid)
-                if (excl):
-                    excluded_car_tracks.append(tid)
-                    continue
-                x = nx[si:se]
-                y = ny[si:se]
-                t = t[si:se]
-                f = f[si:se]
-                ts = ts[si:se]
-            xlen = x.size
-            if (xlen <= 2):
-                continue
-            pathLength = getPathLength(tid, x, y)
-            X = np.array([[x, y] for x, y in zip(x, y)])
-            e = 1
-            mask = rdp(X, epsilon=e, return_mask=True)
-            t = np.ma.compressed(np.ma.masked_where(mask==False, t))
-            f = np.ma.compressed(np.ma.masked_where(mask==False, f))
-            x = np.ma.compressed(np.ma.masked_where(mask==False, x))
-            y = np.ma.compressed(np.ma.masked_where(mask==False, y))
-            ts = np.ma.compressed(np.ma.masked_where(mask==False, ts))
-            diffx = x[x.size-1]-x[0]
-            diffy = y[y.size-1]-y[0]
-            if (diffx > 10):
-                x = np.maximum.accumulate(x)
-            elif (diffx < -10):
-                x = np.minimum.accumulate(x)
-            if (diffy > 10):
-                y = np.maximum.accumulate(y)
-            elif (diffy < -10):
-                y = np.minimum.accumulate(y)
-
-            pathLength = getPathLength(tid, x, y)
-            lengthH[tid] = pathLength
-            maxpathlength = float(options['pathlength'])
-            if (pathLength < maxpathlength):
-                continue
-    
+        if (isPed == False):
             rbit, rbit2 = getGreenBit(x,y)
             pindex = rbit - 1
             if (rbit == 0):
                 pindex = int(8 + rbit2/2 - 1)
             if (pindex < 0):
                 continue
-            rrange = rangex
-            nt = Track(tid, x, y, rrange)
-            nt.x = x
-            nt.arr = y
-            nt.start = si
-            nt.end = se
-            nt.classtype = c[0]
-            nt.phasetype = phasetype
-            nt.cycle = cyclenum
-            nt.len = pathLength
-            nt.iid = iid[0]
-            sx, sy, spindex, check = setSpeed(x, y, t, nt)
-            maxSpeed = getMaxSpeed(tid, sx, sy)
-            if (cindex == pedindex and maxSpeed > 130):
+            elif ((rbit==2 or rbit==6 or rbit==4 or rbit==8) and pathLength < 200):
                 continue
-            elif (cindex != pedindex and maxSpeed < 100):
+        else:
+            rbit2 = 0
+            rbit = getPedGreenBit(x,y)
+            pindex = rbit - 1
+            if (pindex < 0):
                 continue
-            gtracks[cindex][pindex].append(tid)
-            ntrackobj[cindex][pindex] = ntrackobj[cindex][pindex] + 1
-            #Create interpolated versions of each track
-    
-            tracksH[tid] = nt
-            if (tid > maxtrackid):
-                maxtrackid = tid
-    
-        print ("mixed phases:", nummixedphases)
-        end = time.time()
-        print ("Finished reading tracks file and initializing data structures", end - start)
-        print ('excluded_car_tracks', len(excluded_car_tracks), excluded_car_tracks)
-        print ('excluded_ped_tracks', len(excluded_ped_tracks), excluded_ped_tracks)
-        print ('track_with_two_points', len(track_with_two_points), track_with_two_points)
-        print ('blobs', len(blobs), blobs)
-        print ('track_with_length_smaller_than_159', len(track_with_length_smaller_than_200), track_with_length_smaller_than_200)
-        print ('track_with_length_smaller_than_150_after_zoning', len(track_with_length_smaller_than_150_after_zoning), track_with_length_smaller_than_150_after_zoning)
-        print ('tweezer_track', len(tweezer_track), tweezer_track)
-        print ('high_speed_ped_track_130', len(high_speed_ped_track_130), high_speed_ped_track_130)
-        print ('low_speed_veh_track_100', len(low_speed_veh_track_100), low_speed_veh_track_100)
-        print ('signal_violate', len(signal_violate), signal_violate)
-        print ('weird_shape', len(weird_shape), weird_shape)
-        print ('track_lane_change', len(track_lane_change), track_lane_change)
-        print ('track_shape', len(track_shape), track_shape)
-        startIndex = 1
-        lobj = len(objects)
-        #lobj = 1
-        odf = pd.DataFrame()
-        fid=0
-        tid=0
-        #change later 1->0 in range
-        prefix = objects.copy()
-        lph = len(phases)
-    
-        #fftracks = {}
-        finalCentroids = []
-        finalCentroidName = []
-        tidlist = []
-        xlist = []
-        ylist = []
-        classlist = []
-        iidlist = []
-        phaselist = []
-        namelist = []
-        centroid_list = []
-        f = open("car_track_clusters.txt", "w")
-        for i in range(0,lobj):
-            if (objects[i] == 'car'):
-                f.write('12\n')
-            for j in range(0,lph):
-                aHash = HashTable(1000)
-                anotracksthreshold = 0
-                if (ntrackobj[i][j] > 1000):
-                    anotracksthreshold = int(ntrackobj[i][j] * 0.005)
-                print ('Begin clustering', objects[i], 'for phase', phases[j])
-                ptracks = gtracks[i][j]
-                lptracks = len(ptracks)
-                if (lptracks == 0):
-                    continue
-                A = []
-                X = []
-                F = []
-                L = []
-                for p in range(0,lptracks):
-                    xd = []
-                    d = []
-                    fd = []
-                    ld = []
-                    A.append(d)
-                    X.append(xd)
-                    F.append(fd)
-                    L.append(ld)
-                    trackp = ptracks[p]
-                    for q in range(0,lptracks):
-                        trackq = ptracks[q]
-                        if (trackp == trackq):
-                            #d.append(0)
-                            d.append(1)
-                            xd.append(0)
-                            fd.append(0)
-                            ld.append(0)
-                        else:
-                            if ((trackp, trackq) in distancedict):
-                                (tdist, firstdiff, lastdiff) = distancedict[(trackp, trackq)]
-                            else:
-                                tdist, maxdiff, dist, lenratio, firstdiff, lastdiff = distance(tracksH[trackp], tracksH[trackq], 200)
-                                distancedict[(trackp, trackq)] = (tdist, firstdiff, lastdiff)
-                                distancedict[(trackq, trackp)] = (tdist, firstdiff, lastdiff)
-                            if (tdist > 25 or firstdiff > 15 or lastdiff > 15):
-                                d.append(0)
-                            else:
-                                d.append(1) 
-                            xd.append(tdist)
-                            fd.append(firstdiff)
-                            ld.append(lastdiff)
-                for key,val in distancedict.items():
-                    print (key, '->', val)
-                #print(A)
-                #print(X)
-                #print(F)
-                #print(L)
-                D = np.diag(np.sum(A, axis=1))
-                # graph laplacian
-                L = D-A
-                # eigenvalues and eigenvectors
-                vals, vecs = np.linalg.eig(L)
-                # sort these based on the eigenvalues
-                vecs = vecs[:,np.argsort(vals)].real
-                vals = vals[np.argsort(vals)].real
-                print(vals)
+            elif ((rbit==2 or rbit==6 or rbit==4 or rbit==8) and pathLength < 200):
+                continue
+        rrange = rangex
+        nt = Track(tid, x, y, rrange)
+        nt.x = x
+        nt.arr = y
+        nt.start = si
+        nt.end = se
+        nt.classtype = c[0]
+        #nt.phasetype = phasetype
+        nt.phasetype = phases[pindex]
+        nt.cycle = cyclenum
+        nt.len = pathLength
+        nt.iid = iid[0]
+        nt.t = t
+        nt.ts = ts
+        nt.f = f
+        nt.nm = nm
+        nt.sig = sig
+        nt.uid = uid
+        sx, sy, spindex, check = setSpeed(x, y, t, nt)
+        maxSpeed = getMaxSpeed(tid, sx, sy)
+        if (cindex == pedindex and maxSpeed > 130):
+            continue
+        elif (cindex != pedindex and maxSpeed < 100):
+            continue
+        nt.sx = sx
+        nt.sy = sy
+        gtracks[cindex][pindex].append(tid)
+        ntrackobj[cindex][pindex] = ntrackobj[cindex][pindex] + 1
+        #Create interpolated versions of each track
 
-                #limiteigen = 0.1 * vals[vals.size-1]
-                #count = len([eigen for eigen in vals if eigen < limiteigen])
-                count = 1
-                if (vals.size > 1):
-                    if (phases[j] % 2 == 0):
-                        limiteigen = 0.05 * vals[vals.size-1]
-                        if (limiteigen > 0):
-                            count = len([eigen for eigen in vals if eigen < limiteigen])
-                        else:
-                            count = vals.size
-                    else:
-                        limiteigen = 0.1 * vals[vals.size-1]
-                        if (limiteigen > 0):
-                            count = len([eigen for eigen in vals if eigen < limiteigen])
-                        else:
-                            count = vals.size
-                        #count = np.argmax(np.diff(vals)) + 1
-                if (count > 1):
-                    # kmeans on first three vectors with nonzero eigenvalues
-                    kmeans = KMeans(n_clusters=count)
-                    kmeans.fit(vecs[:,0:count-1])
-                    colors = kmeans.labels_
+        tracksH[tid] = nt
+        if (tid > maxtrackid):
+            maxtrackid = tid
 
-                    findCentroidsOfMultipleClusters(ptracks, colors, phases[j], centroid_list)
-                    print("Clusters:", count, colors)
-                    for p in range(0,lptracks):
-                        nt = tracksH[ptracks[p]]
-                        nt.clus = objects[i] + str(phases[j]) + '-' + str(colors[p])
-                    print(ptracks)
-                    if (objects[i] == 'car'):
-                        ptracksarray = np.asarray(ptracks)
-                        numtracks=0
-                        s=0
-                        totaltracks = len(ptracks)
-                        while (numtracks<totaltracks):
-                            subarray = ptracksarray[np.where(colors==s)[0]]
-                            f.write(str(len(subarray))+' ')
-                            f.write(objects[i] + str(phases[j])+'-' + str(s) + ' ')
-                            f.write(str(subarray).strip('[]')+'\n')
-                            s = s+1
-                            numtracks = numtracks + len(subarray)
+    end = time.time()
+    startIndex = 1
+    lobj = len(objects)
+    #lobj = 1
+    odf = pd.DataFrame()
+    fid=0
+    tid=0
+    #change later 1->0 in range
+    prefix = objects.copy()
+    lph = len(phases)
+
+    #fftracks = {}
+    finalCentroids = []
+    finalCentroidName = []
+    tidlist = []
+    xlist = []
+    ylist = []
+    classlist = []
+    iidlist = []
+    phaselist = []
+    namelist = []
+    centroid_list = []
+    f = open("pedestrian_track_clusters.txt", "w")
+    for i in range(0,lobj):
+        if (objects[i] == 'pedestrian'):
+            f.write('12\n')
+        for j in range(0,lph):
+            aHash = HashTable(1000)
+            anotracksthreshold = 0
+            if (ntrackobj[i][j] > 1000):
+                anotracksthreshold = int(ntrackobj[i][j] * 0.005)
+            print ('Begin clustering', objects[i], 'for phase', phases[j])
+            ptracks = gtracks[i][j]
+            lptracks = len(ptracks)
+            if (lptracks == 0):
+                continue
+            numtracks = 100
+            if (lptracks < numtracks):
+                numtracks = lptracks
+            centroids = findClusterCenters(ptracks[:numtracks], phases[j], objects[i], f)
+            centroid_list.extend(centroids)
+            for t in range(numtracks, lptracks):
+                nt = tracksH[ptracks[t]]
+                processTrack(nt, centroids)
+            writeToClusterFile(ptracks, del_file, 'a')
+    f.close()
+    writeToCentroidsTableAndFile(centroid_list, engine)
+
+def processTrack(nt, centroids):
+    cindex = 0
+    minval = 10000
+    i = 0
+    for c in centroids:
+        tdist, maxdiff, dist, lenratio, firstdiff, lastdiff = distance(nt, c, 200)
+        tdist1, maxdiff, dist, lenratio, firstdiff1, lastdiff1 = distance(c, nt, 200)
+        d = (tdist + tdist1)/2
+        if (d < minval):
+            minval = d
+            cindex = i
+        i = i+1
+    if (minval < 50):
+        nt.clus = centroids[cindex].clus
+    else:
+        nt.clus = 'anom'
+        nt.isanomalous = 2
+    return
+
+def findClusterCenters(ptracks, phase, oclass, f):
+    centroid_list = []
+    lptracks = len(ptracks)
+    print (ptracks)
+    A = []
+    X = []
+    F = []
+    L = []
+    for p in range(0,lptracks):
+        xd = []
+        d = []
+        fd = []
+        ld = []
+        A.append(d)
+        X.append(xd)
+        F.append(fd)
+        L.append(ld)
+        trackp = ptracks[p]
+        for q in range(0,lptracks):
+            trackq = ptracks[q]
+            if (trackp == trackq):
+                #d.append(0)
+                d.append(1)
+                xd.append(0)
+                fd.append(0)
+                ld.append(0)
+            else:
+                if ((trackp, trackq) in distancedict):
+                    (tdist, firstdiff, lastdiff) = distancedict[(trackp, trackq)]
                 else:
-                    print("There is just one cluster")
-                    print(ptracks)
-                    if (objects[i] == 'car'):
-                        f.write(str(lptracks)+' ')
-                        f.write(objects[i] + str(phases[j])+' ')
-                        f.write(str(ptracks).strip('[]')+'\n')
-                    findCentroid(ptracks, phases[j], centroid_list)
-                    for p in range(0,lptracks):
-                        nt = tracksH[ptracks[p]]
-                        nt.clus = objects[i] + str(phases[j])
-        f.close()
-        writeToCentroidsTable(centroid_list, engine)
-        #wait until ctime reaches endof interval time
-        while (ctime < endctime):
-            #wait for a minute
-            ctime = ctime + datetime.timedelta(minutes=1)
+                    tdist, maxdiff, dist, lenratio, firstdiff, lastdiff = distance(tracksH[trackp], tracksH[trackq], 200)
+                    tdist1, maxdiff, dist, lenratio, firstdiff1, lastdiff1 = distance(tracksH[trackq], tracksH[trackp], 200)
+                    distancedict[(trackp, trackq)] = ((tdist+tdist1)/2, min(firstdiff, firstdiff1), min(lastdiff, lastdiff1))
+                    distancedict[(trackq, trackp)] = ((tdist+tdist1)/2, min(firstdiff, firstdiff1), min(lastdiff, lastdiff1))
+                if (tdist > 25 or firstdiff > 15 or lastdiff > 15):
+                    d.append(0)
+                else:
+                    d.append(1) 
+                xd.append(tdist)
+                fd.append(firstdiff)
+                ld.append(lastdiff)
+    #for key,val in distancedict.items():
+        #print (key, '->', val)
+    D = np.diag(np.sum(A, axis=1))
+    # graph laplacian
+    L = D-A
+    # eigenvalues and eigenvectors
+    vals, vecs = np.linalg.eig(L)
+    # sort these based on the eigenvalues
+    vecs = vecs[:,np.argsort(vals)].real
+    vals = vals[np.argsort(vals)].real
+    print(vals)
+ 
+    #limiteigen = 0.1 * vals[vals.size-1]
+    #count = len([eigen for eigen in vals if eigen < limiteigen])
+    count = 1
+    if (vals.size > 1):
+        if (phase % 2 == 0):
+            limiteigen = 0.05 * vals[vals.size-1]
+            if (limiteigen > 0):
+                count = len([eigen for eigen in vals if eigen < limiteigen])
+            else:
+                count = vals.size
+        else:
+            limiteigen = 0.1 * vals[vals.size-1]
+            if (limiteigen > 0):
+                count = len([eigen for eigen in vals if eigen < limiteigen])
+            else:
+                count = vals.size
+            #count = np.argmax(np.diff(vals)) + 1
+    if (count > 1):
+        # kmeans on first three vectors with nonzero eigenvalues
+        kmeans = KMeans(n_clusters=count)
+        kmeans.fit(vecs[:,0:count-1])
+        colors = kmeans.labels_
+ 
+        findCentroidsOfMultipleClusters(ptracks, colors, phase, oclass, centroid_list)
+        print("Clusters:", count, colors)
+        for p in range(0,lptracks):
+            nt = tracksH[ptracks[p]]
+            nt.clus = oclass + str(phase) + '-' + str(colors[p])
+        print(ptracks)
+        if (oclass == 'pedestrian'):
+            ptracksarray = np.asarray(ptracks)
+            numtracks=0
+            s=0
+            totaltracks = len(ptracks)
+            while (numtracks<totaltracks):
+                subarray = ptracksarray[np.where(colors==s)[0]]
+                f.write(str(len(subarray))+' ')
+                f.write(oclass + str(phase)+'-' + str(s) + ' ')
+                f.write(str(subarray).strip('[]')+'\n')
+                s = s+1
+                numtracks = numtracks + len(subarray)
+    else:
+        print("There is just one cluster")
+        print(ptracks)
+        if (len(ptracks) > 1):
+            if (oclass == 'pedestrian'):
+                f.write(str(lptracks)+' ')
+                f.write(oclass + str(phase)+' ')
+                f.write(str(ptracks).strip('[]')+'\n')
+            new_track = findCentroid(ptracks, phase, oclass, 0)
+            centroid_list.append(new_track)
+        else:
+            print("Ignored because there is just one member")
+        #for p in range(0,lptracks):
+            #nt = tracksH[ptracks[p]]
+            #nt.clus = oclass + str(phase)
+            #beg, end = trimTrack(nt, new_track)
 
-def writeToCentroidsTable(centroid_list, engine):
+    return centroid_list
+
+def trimTrack(track, centroid):
+    ntpair = [[x, y] for x, y in zip(track.x, track.arr)]
+    nt1pair = [[x, y] for x, y in zip(centroid.x, centroid.arr)]
+    dist, path = fastdtw(ntpair, nt1pair, dist=euclidean)
+    endC = track.x.size-1
+    begC = -1
+    beginTrim = begC
+    endTrim = endC
+    found = 0
+    first = 1
+    for pair in path:
+        if (first):
+            first = 0
+        elif ((pair [0] != prevpair[0]) and (pair[1] != prevpair[1])):
+            if (found == 0):
+                if (prevpair[0] != 0): # for paths going as (0, 0), (1, 0), (2, 0)...; not for paths (0,0), (1,1)... or (0,0), (0,1)...
+                    beginTrim = prevpair[0]
+                break;
+        prevpair = pair
+    first = 1
+    for pair in reversed(path):
+        if (first):
+            first = 0
+        elif ((pair [0] != prevpair[0]) and (pair[1] != prevpair[1])):
+            if (found == 0):
+                if (prevpair[0] != endC): # for paths ... (12, x), (13, x), not for paths ..., (12,x), (13, x+1) or ..., (13, x), (13, x+1)
+                    endTrim = prevpair[0]
+                break;
+        prevpair = pair
+    if (beginTrim > begC):
+        adjustTrackBeginning(beginTrim, track)
+    if (endTrim < endC):
+        adjustTrackEnding(endTrim, track)
+    return beginTrim, endTrim
+
+def adjustTrackBeginning(begIndex, track):
+    track.x = track.x[begIndex:]
+    track.arr = track.arr[begIndex:]
+    track.t = track.t[begIndex:]
+    track.ts = track.ts[begIndex:]
+    track.f = track.f[begIndex:]
+    track.sx = track.sx[begIndex:]
+    track.sy = track.sy[begIndex:]
+    track.cycles = track.cycles[begIndex:]
+
+def adjustTrackEnding(endIndex, track):
+    track.x = track.x[0:endIndex]
+    track.arr = track.arr[0:endIndex]
+    track.t = track.t[0:endIndex]
+    track.ts = track.ts[0:endIndex]
+    track.f = track.f[0:endIndex]
+    track.sx = track.sx[0:endIndex]
+    track.sy = track.sy[0:endIndex]
+    track.cycles = track.cycles[0:endIndex]
+
+def writeToDisplayInfo(ptracks, mode):
+    uidlist           = []
+    framelist         = []
+    tracklist         = []
+    xlist             = []
+    ylist             = []
+    classlist         = []
+    timelist          = []
+    intersectionlist  = []
+    phaselist         = []
+    cyclelist         = []
+    speedxlist        = []
+    speedylist        = []
+    cluslist          = []
+    anomlist          = []
+    rjlist            = []
+    nmlist            = []
+    siglist           = []
+    for t in ptracks:
+        nt = tracksH[t]
+        r = nt.x.size
+        uidlist.extend([nt.uid for k in range(r)])
+        framelist.extend(nt.f)
+        tracklist.extend([nt.tid for k in range(r)])
+        xlist.extend(nt.x)
+        ylist.extend(nt.arr)
+        classlist.extend([nt.classtype for k in range(r)])
+        timelist.extend(pd.to_datetime(nt.ts) + nt.f%10*np.timedelta64(100,'ms'))
+        intersectionlist.extend([nt.iid for k in range(r)])
+        phaselist.extend([nt.phasetype for k in range(r)])
+        cyclelist.extend([nt.cycle for k in range(r)])
+        speedxlist.extend(nt.sx)
+        speedylist.extend(nt.sy)
+        cluslist.extend([nt.clus for k in range(r)])
+        anomlist.extend([nt.isAnomalous for k in range(r)])
+        rjlist.extend([nt.isrj for k in range(r)])
+        nmlist.extend([nt.nm] * r)
+        siglist.extend([nt.sig] * r)
+    displaydf = pd.DataFrame()
+    displaydf['frame_id'] = framelist
+    displaydf['track_id'] = tracklist
+    displaydf['center_x'] = xlist
+    displaydf['center_y'] = ylist
+    displaydf['class'] = classlist
+    displaydf['timestamp'] = timelist
+    displaydf['intersection_id'] = intersectionlist
+    displaydf['SPAT'] = phaselist
+    displaydf['Cycle'] = cyclelist
+    displaydf['speed_x'] = speedxlist
+    displaydf['speed_y'] = speedylist
+    displaydf['Cluster'] = cluslist
+    displaydf['isAnomalous'] = anomlist
+    displaydf['redJump'] = rjlist
+    displaydf['nearmiss'] = nmlist
+    displaydf['signature'] = siglist
+
+    displaydf.dropna(inplace=True)
+    displaydf.to_csv(display_file,  float_format='%.f', mode=mode, header=False, index=False)
+    writeToRealDisplayInfo(displaydf, uidlist, mode)
+
+def writeToRealDisplayInfo(displaydf, uidlist, mode):
+    r = len(uidlist)
+    realdisplaydf = pd.DataFrame()
+    realdisplaydf['unique_ID'] = uidlist
+    realdisplaydf['frame_id'] = displaydf['frame_id']
+    realdisplaydf['track_id'] = displaydf['track_id']
+    realdisplaydf['center_x'] = displaydf['center_x']
+    realdisplaydf['center_y'] = displaydf['center_y']
+    realdisplaydf['class'] = displaydf['class']
+    realdisplaydf['timestamp'] = displaydf['timestamp']
+    realdisplaydf['intersection_id'] = [int(options['cityintid'])] * r
+    realdisplaydf['camera_id'] = [int(options['cameraid'])] * r
+    realdisplaydf['SPAT'] = displaydf['SPAT']
+    realdisplaydf['Cycle'] = displaydf['Cycle']
+    realdisplaydf['speed_x'] = displaydf['speed_x']
+    realdisplaydf['speed_y'] = displaydf['speed_y']
+    realdisplaydf['b1'] = [0] * r
+    realdisplaydf['b2'] = [0] * r
+    realdisplaydf['b3'] = [0] * r
+    realdisplaydf['i1'] = [0] * r
+    realdisplaydf['i2'] = [0] * r
+    realdisplaydf['i3'] = [0] * r
+    realdisplaydf['r1'] = [0] * r
+    realdisplaydf['r2'] = [0] * r
+    realdisplaydf['r3'] = [0] * r
+    realdisplaydf['c1'] = [''] * r
+    realdisplaydf['c2'] = [''] * r
+    realdisplaydf['c3'] = [''] * r
+
+    realdisplaydf.dropna(inplace=True)
+    realdisplaydf.to_csv(real_displayfile,  float_format='%.f', mode=mode, header=False, index=False)
+    return
+
+def writeToTrackProperties(ptracks, mode):
+    r = len(ptracks)
+    intersectionlist  = [int(options['cityintid'])] * r
+    cameraidlist = [int(options['cameraid'])] * r
+    timelist          = []
+    tracklist         = []
+    phaselist         = []
+    cluslist          = []
+    anomlist          = []
+    rjlist            = []
+    nmlist            = []
+    siglist           = []
+    uidlist           = []
+    ignorelist        = []
+    for t in ptracks:
+        nt = tracksH[t]
+        timelist.append(pd.to_datetime(nt.ts[0]) + nt.f[0]%10*np.timedelta64(100,'ms'))
+        tracklist.append(nt.tid)
+        phaselist.append(nt.phasetype)
+        cluslist.append(nt.clus)
+        anomlist.append(nt.isAnomalous)
+        rjlist.append(nt.isrj)
+        nmlist.append(nt.nm)
+        siglist.append(nt.sig)
+        uidlist.append(nt.uid)
+        ignorelist.append(nt.ignore)
+
+    trackdf['intersection_id'] = intersectionlist
+    trackdf['camera_id'] = cameraidlist
+    trackdf['timestamp'] = timelist
+    trackdf['track_id'] = tracklist
+    trackdf['phase'] = phaselist
+    trackdf['cluster'] = cluslist
+    trackdf['isAnomalous'] = anomlist
+    trackdf['redJump'] = rjlist
+    trackdf['nearmiss'] = nmlist
+    trackdf['signature'] = siglist
+    trackdf['unique_ID'] = uidlist
+    trackdf['isctrack'] = [0] * r
+    trackdf['ignoreTrack'] = ignorelist
+    trackdf['b2'] = [0] * r
+    trackdf['b3'] = [0] * r
+    trackdf['i1'] = [0] * r
+    trackdf['i2'] = [0] * r
+    trackdf['i3'] = [0] * r
+    trackdf['r1'] = [0] * r
+    trackdf['r2'] = [0] * r
+    trackdf['r3'] = [0] * r
+    trackdf['c1'] = [''] * r
+    trackdf['c2'] = [''] * r
+    trackdf['c3'] = [''] * r
+
+    trackdf.dropna(inplace=True)
+    trackdf.to_csv(trackprop_file,  float_format='%.f', mode=mode, header=False, index=False)
+    return
+
+def writeToClusterFile(ptracks, fp, mode):
+    alist = []
+    startlist = []
+    endlist = []
+    phlist = []
+    sphlist = []
+    ephlist = []
+    cyclelist = []
+    cluslist = []
+    cdf = pd.DataFrame()
+    cdf['track_id'] = ptracks
+    for t in ptracks:
+        nt = tracksH[t]
+        alist.append(nt.isAnomalous)
+        startlist.append(nt.start)
+        endlist.append(nt.end)
+        phlist.append(nt.phasetype)
+        sphlist.append(nt.phasetype)
+        ephlist.append(nt.phasetype)
+        cyclelist.append(nt.cycle)
+        cluslist.append(nt.clus)
+    df_tracks_with_clusters = pd.DataFrame()
+    df_tracks_with_clusters['track_id'] = ptracks
+    df_tracks_with_clusters['closest'] = cluslist
+    df_tracks_with_clusters['isAnomalous'] = alist
+    df_tracks_with_clusters['startPoint'] = startlist
+    df_tracks_with_clusters['endPoint'] = endlist
+    df_tracks_with_clusters['phase'] = phlist
+    df_tracks_with_clusters['startphase'] = sphlist
+    df_tracks_with_clusters['endphase'] = ephlist
+    df_tracks_with_clusters['cycle'] = cyclelist
+
+    df_tracks_with_clusters.dropna(inplace=True)
+    df_tracks_with_clusters.to_csv(del_file,  float_format='%.f', mode=mode, header=False, index=False)
+
+def writeToCentroidsTableAndFile(centroid_list, engine):
     tidlist = []
     xlist = []
     ylist = []
@@ -493,6 +819,7 @@ def writeToCentroidsTable(centroid_list, engine):
     phaselist = []
     namelist = []
     clen = len(centroid_list)
+    orderlist = []
     for c in centroid_list:
         xlen  = c.x.size
         tidlist.extend([c.tid for k in range(xlen)])
@@ -503,6 +830,7 @@ def writeToCentroidsTable(centroid_list, engine):
         iidlist.extend([options['cityintid'] for k in range(xlen)])
         phaselist.extend([c.phasetype for k in range(xlen)])
         namelist.extend([c.clus for k in range(xlen)])
+        orderlist.extend([k for k in range(xlen)])
     centdf = pd.DataFrame()
     centdf['track_id'] = tidlist
     centdf['x'] = xlist
@@ -512,10 +840,27 @@ def writeToCentroidsTable(centroid_list, engine):
     centdf['intersection_id'] = iidlist
     centdf['phase'] = phaselist
     centdf['name'] = namelist
+    centdf['ordering'] = orderlist
     centdf.to_sql('CentroidsTable', con=engine, if_exists='append', index = False)
+    
+    displaydf = pd.DataFrame()
+    displaydf['frame_id'] = [0] * len(xlist)
+    displaydf['track_id'] = tidlist
+    displaydf['x'] = xlist
+    displaydf['y'] = ylist
+    displaydf['class'] = classlist
+    displaydf['timestamp'] = [pd.to_datetime(options['start'])] * len(xlist)
+    displaydf['intersection_id'] = cameraidlist
+    displaydf['SPAT'] = phaselist
+    displaydf['Cycle'] = [0] * len(xlist)
+    displaydf['speed_x'] = [0] * len(xlist)
+    displaydf['speed_y'] = [0] * len(xlist)
+    displaydf['cluster'] = namelist
+    displaydf['ordering'] = orderlist
+    displaydf.to_csv(options['centroid'], float_format='%.f', index=False)
     return
 
-def findCentroidsOfMultipleClusters(ptracks, colors, phase, centroid_list):
+def findCentroidsOfMultipleClusters(ptracks, colors, phase, objecttype, centroid_list):
     ptracksarray = np.asarray(ptracks)
     numtracks=0
     i=0
@@ -525,10 +870,17 @@ def findCentroidsOfMultipleClusters(ptracks, colors, phase, centroid_list):
         arraylen = len(subarray)
         numtracks = numtracks + arraylen
         if (arraylen > 1):
-            findCentroid(subarray.tolist(), phase, centroid_list)
+            new_track = findCentroid(subarray.tolist(), phase, objecttype, i)
+            centroid_list.append(new_track)
+            #for p in subarray:
+                #nt = tracksH[p]
+                #beg, end = trimTrack(nt, new_track)
+        else:
+            nt = tracksH[subarray[0]]
+            nt.isAnomalous = 1
         i = i+1
 
-def findCentroid(ptracks, phase, centroid_list):
+def findCentroid(ptracks, phase, objecttype, subtype):
     mindist = 10000
     mintrack = -1
     maxlen = 0
@@ -537,9 +889,9 @@ def findCentroid(ptracks, phase, centroid_list):
         return 
 
     #Compute centroid among 10% of members chosen randomly
-    if (slen == 1 or slen == 2):
-        centroid_list.append(tracksH[ptracks[0]])
-        return 
+    if (slen == 1):
+        #centroid_list.append(tracksH[ptracks[0]])
+        return tracksH[ptracks[0]]
 
     for track in ptracks:
         nt1 = tracksH[track]
@@ -552,8 +904,116 @@ def findCentroid(ptracks, phase, centroid_list):
         if (dist < mindist):
             mindist = dist
             mintrack = track
-    centroid_list.append(tracksH[mintrack])
-    return
+    #new_track = ga(tracksH[mintrack], mindist, ptracks)
+    #new_track.tid = int(str(phase) + str(subtype))
+    #new_track.clus = objecttype + str(phase) + '-' + str(subtype) + '-ga'
+    new_track = tracksH[mintrack]
+    new_track.clus = objecttype + str(phase) 
+    return new_track
+
+ga_struct = namedtuple("ga_struct", [ "track", "fitness"])
+
+def ga(inittrack, initdist, ptracks):
+    my_population = []
+    my_buffer = []
+    ga_popsize = 30
+    ga_maxiter = 50
+    ga_eliterate = 0.1
+    delta = 10
+
+    init_population(my_population, my_buffer, inittrack, initdist, ga_popsize, delta)
+
+    last = 0
+    for i in range(0,ga_maxiter):
+        calc_fitness(my_population, ptracks)
+        sort_by_fitness(my_population)
+
+
+
+        if my_population[0].fitness != last:
+            #print (" iter: %d,\t%s, \t score:%d ", i, my_population[0].string, my_population[0].fitness)
+            last = my_population[0].fitness
+        else:
+        #if my_population[0].fitness == 0:
+            break
+
+        mate(my_population, my_buffer, ga_popsize, ga_eliterate, inittrack.x.size, delta, inittrack)
+        (my_buffer, my_population) = (my_population, my_buffer) #swap
+
+    return my_population[0].track
+
+def init_population(ga_population, ga_buffer, inittrack, initdist, ga_popsize, delta):
+    tsize = inittrack.x.size
+
+    dummyTrack = Track(0, 0, 0,0)
+    citizen = ga_struct(inittrack, 0)
+    ga_population.append(citizen)
+    ga_buffer.append(ga_struct(dummyTrack,0))
+    for i in range(0,ga_popsize-1):
+        x_array = np.copy(inittrack.x)
+        y_array = np.copy(inittrack.arr)
+        tid = 1
+        for j in range(0,tsize):
+            x_array[j] = float(random.randint(int((x_array[j]-delta)*1000), int((x_array[j]+delta)*1000)))/1000.0
+            y_array[j] = float(random.randint(int((y_array[j]-delta)*1000), int((y_array[j]+delta)*1000)))/1000.0
+        track = Track(tid, x_array, y_array, 0)
+        track.classtype = inittrack.classtype
+        track.phasetype = inittrack.phasetype
+        citizen = ga_struct(track,0)
+
+        ga_population.append(citizen)
+        ga_buffer.append(ga_struct(dummyTrack,0))
+
+def calc_fitness(ga_population, ptracks):
+    pop_index = 0
+    for item in ga_population:
+        fitness = 0
+        for otrack in ptracks:
+            nt = tracksH[otrack]
+            tdist, maxdiff, dist, lenratio, firstdiff, lastdiff = distance(item.track, nt, 200)
+            fitness = fitness + tdist
+        ga_population[pop_index]  =  item._replace(fitness=fitness)
+        pop_index += 1
+
+def sort_by_fitness(ga_population):
+    ga_population.sort(key=itemgetter(1))
+
+def elitism(ga_population, ga_buffer, esize):
+    for i in range(0,esize):
+        ga_buffer[i] = ga_population[i]
+
+def mate(ga_population, ga_buffer, ga_popsize, ga_eliterate, tsize, delta, inittrack):
+    GA_MUTATIONRATE = 0.25
+    GA_MUTATION = 32768 * GA_MUTATIONRATE
+    esize = int(ga_popsize * ga_eliterate)
+    rand_handler = random.Random()
+
+    elitism(ga_population, ga_buffer, esize)
+
+    #mate the rest
+    for i in range(esize,ga_popsize):
+        i1 = rand_handler.randint(0,int(ga_popsize/2))
+        i2 = rand_handler.randint(0,int(ga_popsize/2))
+        spos = rand_handler.randint(0,tsize)
+
+        nt = Track(1, np.concatenate((ga_population[i1].track.x[0:spos], ga_population[i2].track.x[spos:tsize]), axis=None),
+                np.concatenate((ga_population[i1].track.arr[0:spos], ga_population[i2].track.arr[spos:tsize]), axis=None), 0)
+        nt.classtype = inittrack.classtype
+        nt.phasetype = inittrack.phasetype
+        ga_buffer[i] = ga_struct(nt,ga_buffer[i].fitness)
+        if rand_handler.random() < GA_MUTATION:
+           mutate(ga_buffer,i,tsize,delta)
+
+def mutate(ga_population, index, tsize, delta):
+    rand_handler = random.Random()
+    ipos = rand_handler.randint(0,tsize-1)
+    #new_coordinate = rand_handler.randint(0,ga_population[index].track.x.size)
+    citizen = ga_population[index]
+
+    x_array = ga_population[index].track.x
+    y_array = ga_population[index].track.arr
+    ga_population[index].track.x[ipos]=float(random.randint(int((x_array[ipos]-delta)*1000), int((x_array[ipos]+delta)*1000)))/1000.0
+    ga_population[index].track.arr[ipos]=float(random.randint(int((y_array[ipos]-delta)*1000), int((y_array[ipos]+delta)*1000)))/1000.0
 
 def setSpeed(x, y, ts, nt):
     slistx = []
@@ -1562,6 +2022,33 @@ def getMaxSpeed(tid, sx, sy):
     if (len(sx) > 0):
         d = np.max(np.sqrt(np.add(np.square(sx), np.square(sy))))
     return d
+
+def getAvgDistFromStopbar(stopbar, x, y):
+    phasestart = stopbar[0]
+    phaseend = stopbar[1]
+    x1 = np.repeat(phasestart[0], x.size)
+    y1 = np.repeat(phasestart[1], x.size)
+    x2 = np.repeat(phaseend[0], x.size)
+    y2 = np.repeat(phaseend[1], x.size)
+    dist = getDistanceOfPointFromLine(x1, y1, x2, y2, x, y)
+    meandist = np.average(dist)
+    stddev = np.std(dist)
+    return meandist, stddev
+
+def getPedGreenBit(x, y):
+    bit = 0
+    [Ax, Ay] = [x[x.size-1]-x[0], y[y.size-1]-y[0]]
+    diststd = []
+    diststd.append(getAvgDistFromStopbar(phase2stopbar, x, y))
+    diststd.append(getAvgDistFromStopbar(phase4stopbar, x, y))
+    diststd.append(getAvgDistFromStopbar(phase6stopbar, x, y))
+    diststd.append(getAvgDistFromStopbar(phase8stopbar, x, y))
+    diststdarray = np.asarray(diststd)
+    mindist = np.argmin(diststd, axis=0)
+    bit = mindist[0]*2 + 4
+    if (bit > 8):
+        bit = 2
+    return bit
 
 def getGreenBit(x, y):
     bit = 0

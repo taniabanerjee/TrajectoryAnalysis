@@ -6,12 +6,15 @@ import time
 import pymysql
 import sys
 import multiprocessing as mp
+import scipy as sp
+from scipy import signal
 from ast import literal_eval
 from hash import HashTable
 from scipy.spatial.distance import euclidean
 from fastdtw import fastdtw
 from shapely.geometry import Point, Polygon
 from sqlalchemy import create_engine
+from rdp import rdp
 
 if (len(sys.argv) == 1):
         print ('Error: provide config file')
@@ -35,6 +38,11 @@ with open(filepath) as fp:
    line = fp.readline().rstrip('\n')
    while (line):
        line = extractOptions(fp)
+
+def movingaverage(values, window):
+    weights = np.repeat(1.0, window)/window
+    smas = np.convolve(values, weights, 'valid')
+    return smas
 
 directions = {}
 directions['NS'] = literal_eval(options['NS'])
@@ -86,19 +94,21 @@ objects=options['objects'].split(',')
 
 #@dataclass
 class Track:
-    def __init__(self, tid, x, y, rrange):
+    def __init__(self, tid, uid, x, y, origx, origy, t, ts, f, iid, classtype, rrange, nm, sig):
         self.tid = tid        #track id
         self.rrange = rrange
         self.x = x
         self.arr = y
-        self.t = np.empty(shape=rrange)
-        self.ts = np.empty(shape=rrange)
-        self.f = np.empty(shape=rrange)
-        self.sx = np.empty(shape=rrange)
-        self.sy = np.empty(shape=rrange)
+        self.t = t
+        self.ts = ts
+        self.f = f
+        self.sx = np.zeros(shape=x.size)
+        self.sy = np.zeros(shape=x.size)
+        self.origx = origx
+        self.origy = origy
         self.cid = -1
         self.phasetype = '' #major, minor, leftmajor, leftminor
-        self.classtype = '' #other types are bus, truck, ped
+        self.classtype = classtype #other types are bus, truck, ped
         self.cycles = []      # cycle numbers for which the vehicle is present in the intersection
         self.slope = 0
         self.isAnomalous = 0
@@ -107,13 +117,20 @@ class Track:
         self.end = 0
         self.scale = 1
         self.len = 0
-        self.iid = 0
+        self.iid = str(iid)
         self.clus = 0
         self.iscent = 0
         self.isthrough = True
         self.gbit = 0
         self.gbit2 = 0
         self.phase = 0
+        self.uid = uid
+        self.issmall = 0
+        self.isoutside = 0
+        self.hispeed = 0
+        self.oddshape = 0
+        self.nm = nm
+        self.sig = sig
 
 class PhaseCycle:
     def __init__(self, sTS, eTS, rTS, r, g, m, isG, isY, isR, ped):
@@ -125,6 +142,9 @@ class PhaseCycle:
         self.isGreen = isG     #1 if phase is green, 0 otherwise
         self.isYellow = isY     #1 if phase is green, 0 otherwise
         self.isRed = isR     #1 if phase is green, 0 otherwise
+        self.isPedGreen = isG
+        self.isPedYellow = isY
+        self.isPedRed = isR
         self.pedstatus = ped   #1 if ped call recorded, 0 otherwise
         self.skipDetector = 0
         self.finish = 0
@@ -360,7 +380,7 @@ def distanceOld(nt, nt1, boxDim):
             longlength = z1
     return tdist+maxdiff, maxdiff, distance, lenratio
 
-def distance(nt, nt1, boxDim):
+def distanceR1(nt, nt1, boxDim):
     tdist = 100
     distance = 100000
     prevpair = (0,0)
@@ -412,6 +432,106 @@ def distance(nt, nt1, boxDim):
         tdist = area/(z + z1)
     longlength = z
     return tdist, distance
+
+def distance(nt, nt1, boxDim):
+    tdist = 100
+    distance = 100000
+    ntpair = [[x, y] for x, y in zip(nt.x, nt.arr)]
+    nt1pair = [[x, y] for x, y in zip(nt1.x, nt1.arr)]
+    distance, path = fastdtw (ntpair, nt1pair, dist=euclidean)
+    lenratio = 0
+    maxdiff = 100
+    angled=180
+    firstdiff = 0
+    lastdiff = 0
+    if (distance > 0):
+    #if (distance < 55000):
+        first = 1
+        prevpair = (0,0)
+        longpath = 0
+        area = 0
+        z1=0
+        z=0
+        first = 1
+        distlist = []
+        alist = []
+        secalist = []
+        secalist1 = []
+        zlist = []
+        z1list = []
+        el = 0
+        el1 = 0
+        for pair in path:
+            if (first):
+                first = 0
+            elif ((pair [0] != prevpair[0]) and (pair[1] != prevpair[1])):
+                [Ax, Ay] = [nt.x[pair[0]], nt.arr[pair[0]]]
+                [Bx, By] = [nt1.x[pair[1]], nt1.arr[pair[1]]]
+                [Cx, Cy] = [nt1.x[prevpair[1]], nt1.arr[prevpair[1]]]
+                secarea1 = 0.5*np.absolute(Ax * (By - Cy) + Bx * (Cy - Ay) + Cx * (Ay - By))
+                seclen1 = math.sqrt((nt1.x[pair[1]] - nt1.x[prevpair[1]])**2 + (nt1.arr[pair[1]]-nt1.arr[prevpair[1]])**2)
+                area = area + secarea1
+                z1 = z1 + seclen1
+                [Ax, Ay] = [nt.x[prevpair[0]], nt.arr[prevpair[0]]]
+                [Bx, By] = [nt.x[pair[0]], nt.arr[pair[0]]]
+                [Cx, Cy] = [nt1.x[prevpair[1]], nt1.arr[prevpair[1]]]
+                secarea = 0.5*np.absolute(Ax * (By - Cy) + Bx * (Cy - Ay) + Cx * (Ay - By))
+                seclen = math.sqrt((nt.x[prevpair[0]]-nt.x[pair[0]])**2 + (nt.arr[prevpair[0]]-nt.arr[pair[0]])**2)
+                area = area + secarea
+                z = z + seclen
+                alist.append(secarea1+secarea)
+                zlist.append(seclen)
+                z1list.append(seclen1)
+                secalist.append(secarea)
+                secalist1.append(secarea1)
+                if ((seclen + seclen1) > 0):
+                    distlist.append((secarea + secarea1)/(seclen + seclen1))
+#            elif ((pair[0] != prevpair[0])):
+#                [Ax, Ay] = [nt.x[prevpair[0]], nt.arr[prevpair[0]]]
+#                [Bx, By] = [nt.x[pair[0]], nt.arr[pair[0]]]
+#                [Cx, Cy] = [nt1.x[prevpair[1]], nt1.arr[prevpair[1]]]
+#                secarea = 0.5*np.absolute(Ax * (By - Cy) + Bx * (Cy - Ay) + Cx * (Ay - By))
+#                seclen = math.sqrt((nt.x[prevpair[0]]-nt.x[pair[0]])**2 + (nt.arr[prevpair[0]]-nt.arr[pair[0]])**2)
+#                area = area + secarea
+#                z = z + seclen
+#                if (seclen > 0):
+#                    distlist.append(secarea/seclen)
+#            elif ((pair[1] != prevpair[1])):
+#                [Ax, Ay] = [nt.x[pair[0]], nt.arr[pair[0]]]
+#                [Bx, By] = [nt1.x[pair[1]], nt1.arr[pair[1]]]
+#                [Cx, Cy] = [nt1.x[prevpair[1]], nt1.arr[prevpair[1]]]
+#                secarea = 0.5*np.absolute(Ax * (By - Cy) + Bx * (Cy - Ay) + Cx * (Ay - By))
+#                seclen = math.sqrt((nt1.x[pair[1]] - nt1.x[prevpair[1]])**2 + (nt1.arr[pair[1]]-nt1.arr[prevpair[1]])**2)
+#                area = area + secarea
+#                z1 = z1 + seclen
+#                if (seclen > 0):
+#                    distlist.append(secarea/seclen)
+
+            prevpair = pair
+
+        distarray = np.asarray(distlist)
+        distarray = distarray - np.mean(distarray)
+        maxdiff = np.amax(np.absolute(distarray))
+        zlistlen = len(zlist)
+        n = zlistlen-2
+        if (zlistlen > 1):
+            if (zlist[1] > 0 and z1list[1] > 0):
+                firstdiff = max(secalist[1]/zlist[1], secalist1[1]/z1list[1])
+            elif (zlist[1] + z1list[1] > 0):
+                firstdiff = (alist[1]/(zlist[1] + z1list[1]))
+        if (n > 0):
+            if (zlist[n] > 0 and z1list[n] > 0):
+                lastdiff = max(secalist[n]/zlist[n], secalist1[n]/z1list[n])
+            elif (zlist[n] + z1list[n] > 0):
+                lastdiff = alist[n]/(zlist[n] + z1list[n])
+        if ((z + z1) > 0):
+            tdist = area/(z + z1)
+            lenratio = (z + z1)/(z + z1 + el + el1)
+        longlength = z
+        if (longpath == 1):
+            longlength = z1
+
+    return tdist, maxdiff, distance, lenratio, firstdiff, lastdiff
 
 def getMxmVal(x, y, mxm, ovl):
     if (x == y):
@@ -646,6 +766,7 @@ def isOnSameLane(nt1, nt2):
         status = dist < 20
     return status
 
+#point is (x0, y0), line is given by two points (x1, y1) and (x2, y2)
 def getDistanceOfPointFromLine(x1, y1, x2, y2, x0, y0):
     dist = np.absolute((y2-y1) * x0 - (x2 - x1) * y0 + x2*y1 - y2*x1)/(np.sqrt(np.add(np.square(y2-y1), np.square(x2-x1))))
     return dist
@@ -736,14 +857,15 @@ def closeToMembers(centi, centj, isPed):
                         nt2 = centj
                         n1 = nt1.x.size
                         n2 = nt2.x.size
-                        if (tdist < 25):
-                            status = True
-                        elif (nt1.x[n1-1] < nt2.x[0] or nt2.x[n2-1] < nt1.x[0] and strictly_increasing(nt1.x)):
-                            status = True
-                        elif (nt1.x[n1-1] > nt2.x[0] or nt2.x[n2-1] > nt1.x[0] and strictly_decreasing(nt1.x)):
-                            status = True
-                        else:
-                            status = False
+                        status = True
+                        #if (tdist < 25):
+                            #status = True
+                        #elif (nt1.x[n1-1] < nt2.x[0] or nt2.x[n2-1] < nt1.x[0] and strictly_increasing(nt1.x)):
+                            #status = True
+                        #elif (nt1.x[n1-1] > nt2.x[0] or nt2.x[n2-1] > nt1.x[0] and strictly_decreasing(nt1.x)):
+                            #status = True
+                        #else:
+                            #status = False
                     #elif (tdist < 20 and maxdiff < 25):
                         #status = True
                     elif (tdist < 45 and centj.isthrough):
@@ -917,10 +1039,12 @@ eventPIndex = 3
 
 step = datetime.timedelta(seconds=1)
 sigstatus = bytearray(b'000000000000000011111111')
+sigPedstatus = bytearray(b'000000000000000011111111')
 previousTime = -1
 phaseInfo = []
 numPhases = 16
 currentPhase = ''
+currentPedPhase = ''
 k = 0
 while k <= numPhases:      #assign and initialize a phase cycle list for each phase
     cycleList = []
@@ -935,6 +1059,7 @@ def processEventList(eventList, currentTime, reportTime, spatrows):
     global cycle_mark
     global j
     global currentPhase
+    global currentPedPhase
     if (i != 0 and currentTime > reportTime): #time to dump data, one second is over
         while (reportTime < currentTime):
             k = 1
@@ -946,6 +1071,9 @@ def processEventList(eventList, currentTime, reportTime, spatrows):
                     sigstatus[k-1] = ord(str(phaseInfo[k][0].isGreen))
                     sigstatus[k+7] = ord(str(phaseInfo[k][0].isYellow))
                     sigstatus[k+15] = ord(str(phaseInfo[k][0].isRed))
+                    sigPedstatus[k-1] = ord(str(phaseInfo[k][0].isPedGreen))
+                    sigPedstatus[k+7] = ord(str(phaseInfo[k][0].isPedYellow))
+                    sigPedstatus[k+15] = ord(str(phaseInfo[k][0].isPedRed))
                     #print (k, sigstatus.decode())
                 k = k+1     #Next phase
             if ('-' not in sigstatus.decode()):
@@ -962,10 +1090,28 @@ def processEventList(eventList, currentTime, reportTime, spatrows):
                 #if (debugH[str(reportTime.strftime("%Y-%m-%d %H:%M:%S.%f"))] != None):
                     #debug = 1
                 if (currentPhase != phasestr):
-                    spatrow = (options['cityintid'], options['cameraid'], reportTime.strftime("%Y-%m-%d %H:%M:%S.%f"), phasestr, str(cycle_no), 'Gainesville','FL')
+                    spatrow = (options['cityintid'], options['cameraid'], reportTime.strftime("%Y-%m-%d %H:%M:%S.%f"), phasestr, str(cycle_no), 'Gainesville','FL',1)
                     #debugH[str(reportTime.strftime("%Y-%m-%d %H:%M:%S.%f"))] = 1
                     spatrows.append(spatrow)
                     currentPhase = phasestr
+            if ('-' not in sigPedstatus.decode()):
+                hexstr = "%x" % int(sigPedstatus.decode(), 2)
+                l = len(hexstr)
+                paddedzeroes = 6-l
+                fhexstr = '0' * paddedzeroes + hexstr
+                redstr = hexstr[0:1]
+                #print (fhexstr)
+                j = j + 1
+                #convert reportTime
+                #roundedtime = reportTime.round('1s')
+                phasestr = '0' * paddedzeroes + hexstr
+                #if (debugH[str(reportTime.strftime("%Y-%m-%d %H:%M:%S.%f"))] != None):
+                    #debug = 1
+                if (currentPedPhase != phasestr):
+                    spatrow = (options['cityintid'], options['cameraid'], reportTime.strftime("%Y-%m-%d %H:%M:%S.%f"), phasestr, str(cycle_no), 'Gainesville','FL',0)
+                    #debugH[str(reportTime.strftime("%Y-%m-%d %H:%M:%S.%f"))] = 1
+                    spatrows.append(spatrow)
+                    currentPedPhase = phasestr
             #reportTime = reportTime + step
             reportTime = currentTime
     for row in eventList:
@@ -999,6 +1145,24 @@ def processEventList(eventList, currentTime, reportTime, spatrows):
                 currentCycle.isGreen = 0
                 currentCycle.isYellow = 1
                 currentCycle.isRed = 0
+        elif (row[eventCIndex] == 21):                   #Ped begin walk
+            #length = len(phaseInfo[row[2]])
+            currentCycle = phaseInfo[row[eventPIndex]][0]
+            currentCycle.isPedGreen = 1
+            currentCycle.isPedYellow = 0
+            currentCycle.isPedRed = 0
+        elif (row[eventCIndex] == 23):                   #Ped dont walk
+            #length = len(phaseInfo[row[2]])
+            currentCycle = phaseInfo[row[eventPIndex]][0]
+            currentCycle.isPedGreen = 0
+            currentCycle.isPedYellow = 0
+            currentCycle.isPedRed = 1
+        elif (row[eventCIndex] == 22):                   # Ped begin clearence (countdown)
+            currentCycle = phaseInfo[row[eventPIndex]][0]
+            if (currentCycle.isPedGreen == 1):
+                currentCycle.isPedGreen = 0
+                currentCycle.isPedYellow = 1
+                currentCycle.isPedRed = 0
     return reportTime
 
 def convertToSPaT(sdf, currentTime):
@@ -1018,6 +1182,8 @@ def convertToSPaT(sdf, currentTime):
             previousTime = currentTime
         if (row[eventCIndex] == 9 or row[eventCIndex] == 8 or row[eventCIndex] == 1):
             eventList.append(row)
+        if (row[eventCIndex] == 21 or row[eventCIndex] == 22 or row[eventCIndex] == 23):
+            eventList.append(row)
     if (reportTime != currentTime):
         reportTime = processEventList(eventList, previousTime, reportTime, spatrows)
         eventList.clear()
@@ -1028,106 +1194,157 @@ def getSPaTIndex(spatdf, ts):
     index = np.searchsorted(spatdf.timestamp.values, ts) - 1
     return index
 
-def processTrack(tid, df, spatdf, geoclusters, centroid_list, centroids, tH):
+def adjustTrackBeginning(begIndex, track):
+    track.x = track.x[begIndex:]
+    track.arr = track.arr[begIndex:]
+    track.t = track.t[begIndex:]
+    track.ts = track.ts[begIndex:]
+    track.f = track.f[begIndex:]
+    track.sx = track.sx[begIndex:]
+    track.sy = track.sy[begIndex:]
+    track.cycles = track.cycles[begIndex:]
+
+def adjustTrackEnding(endIndex, track):
+    track.x = track.x[0:endIndex]
+    track.arr = track.arr[0:endIndex]
+    track.t = track.t[0:endIndex]
+    track.ts = track.ts[0:endIndex]
+    track.f = track.f[0:endIndex]
+    track.sx = track.sx[0:endIndex]
+    track.sy = track.sy[0:endIndex]
+    track.cycles = track.cycles[0:endIndex]
+
+def trackStartsAndEndsBeforeStopBar(pol, x, y, isPed):
+    status = False
+    if (isPed):
+        return status
+
+    s = len(x)
+    p = Point(x[0], y[0])
+    i = 1
+    while (i<s and pol.contains(p) == False):
+        p = Point(x[i], y[i])
+        i = i + 1
+
+    if (i == s):
+        status = True
+
+    return status
+
+def processTrack(tid, videodf, spatdf, geoclusters, centroid_list, centroids, tH):
     updaterows = []
     insertrows = []
     inserttrackrows = []
     updateindex = -1
     oldclus = 'anom'
     s1 = time.time()
-    ndf = df.loc[df['track_id'] == tid]
+    ndf = videodf.loc[videodf['track_id'] == tid]
     t = ndf['time']
     f = ndf['frame_id']
-    x = ndf['center_x']
-    y = ndf['center_y']
+    origx = ndf['center_x'].copy()
+    origy = ndf['center_y'].copy()
+    x = ndf['center_x'].replace(to_replace=0, method='ffill').replace(to_replace=0, method='bfill')
+    y = ndf['center_y'].replace(to_replace=0, method='ffill').replace(to_replace=0, method='bfill')
     c = ndf['class']
     ts = ndf['timestamp']
     iid = ndf['intersection_id']
     nm = ndf['nearmiss']
     sig = ndf['signature']
-    #t = ndf.iloc[:,0].values
-    #f = ndf.iloc[:,1].values
-    #x = ndf.iloc[:,3].values
-    #y = ndf.iloc[:,4].values
-    #c = ndf.iloc[:,5].values
-    #ts = ndf.iloc[:,6].values
-    #iid = ndf.iloc[:,7].values
-    #nm = ndf.iloc[:,8].values
-    #sig = ndf.iloc[:,9].values
+    uid = ndf['unique_ID']
     debug = 1
     s2 = time.time()
-    y = np.ma.compressed(np.ma.masked_where(x==0, y))
-    t = np.ma.compressed(np.ma.masked_where(x==0, t))
-    f = np.ma.compressed(np.ma.masked_where(x==0, f))
-    ts = np.ma.compressed(np.ma.masked_where(x==0, ts))
-    #ts = ts + np.timedelta64(offset,'s')
-    nm = np.ma.compressed(np.ma.masked_where(x==0, nm))
-    sig = np.ma.compressed(np.ma.masked_where(x==0, sig))
-    x = np.ma.compressed(np.ma.masked_where(x==0, x))
-    s3 = time.time()
-    if (x.size == 0):
-        nt = Track(tid, x, y, 1260)
-        outputdf = pd.DataFrame()
-        nt.classtype = c.iloc[0]
-        nt.iid = iid.iloc[0]
-        nt.t = t
-        nt.ts = ts
-        nt.f = f
-        return updaterows, outputdf, inserttrackrows, nt
-    phaseindex = ts.size - 2
-    if (phaseindex < 0):
-        phaseindex = ts.size - 1
-    s4 = time.time()
-    exactmatch = spatdf.iloc[np.searchsorted(spatdf.timestamp.values, ts[phaseindex]+(f[phaseindex]%10)*np.timedelta64(100,'ms')) - 1]
+    x.reset_index(inplace=True, drop=True)
+    y.reset_index(inplace=True, drop=True)
+    if (x.size > 0 and x[0] == 0 and y[0] == 0):
+        print ("Ignoring 0 coordinate track or track section")
+        return updaterows, '', inserttrackrows, '', 1
+        #return createDummyTrack(tH, tid, updateindex, uid.iloc[0], x, y, origx, origy, 1, 0, c.iloc[0], iid.iloc[0], t, ts, f, 0, 0, 1260, updaterows, inserttrackrows, nm[0], sig[0], 'small', 1)
+    if (x.size > 2):
+        x = sp.signal.medfilt(x, 3)
+        y = sp.signal.medfilt(y, 3)
+    else:
+        x = np.asarray(x)
+        y = np.asarray(y)
+    t = np.asarray(t)
+    f = np.asarray(f)
+    ts = np.asarray(ts)
+    nm = np.asarray(nm)
+    sig = np.asarray(sig)
+    origx = np.asarray(origx)
+    origy = np.asarray(origy)
+    s5 = time.time()
+    nt = tH[tid]
+    rrange = 1260
+    if (nt != None and nt.iscent != 1):
+        updateindex = nt.x.size
+        nt.x = np.concatenate([nt.x, x])
+        nt.arr = np.concatenate([nt.arr, y])
+        nt.t = np.concatenate([nt.t, t])
+        nt.ts = np.concatenate([nt.ts, ts])
+        nt.f = np.concatenate([nt.f, f])
+        nt.origx = origx
+        nt.origy = origy
+        nt.sx = np.zeros(shape=nt.x.size)
+        nt.sy = np.zeros(shape=nt.x.size)
+        oldclus = nt.clus
+        #have to make new assessments for the following
+        nt.issmall = 0
+        nt.isoutside = 0
+        nt.oddshape = 0
+        nt.hispeed = 0
+        nt.isAnomalous = 0
+    else:
+        nt = Track(tid, uid.iloc[0], x, y, origx, origy, t, ts, f, iid.iloc[0], c.iloc[0], rrange, nm[0], sig[0])
+    s6 = time.time()
+
+    isPed = False
+    if (c.iloc[0]=='pedestrian'):
+        isPed = True
+    #check for tracks with very small lengrh with respect to the centroid
+    if (nt.x.size <= 2 ):
+        phaseindex = 0
+    else:
+        phaseindex = ts.size - 2
+    if (isPed == False):
+        vehspat = spatdf[spatdf['type']==1]
+        exactmatch = vehspat.iloc[np.searchsorted(vehspat.timestamp.values, ts[phaseindex]+(f[phaseindex]%10)*np.timedelta64(100,'ms')) - 1]
+    else:
+        pedspat = spatdf[spatdf['type']==0]
+        if (pedspat.empty):
+            return createTrackData(nt, updateindex, updaterows, inserttrackrows, 'pednotallowed', 0)
+        exactmatch = pedspat.iloc[np.searchsorted(pedspat.timestamp.values, ts[phaseindex]+(f[phaseindex]%10)*np.timedelta64(100,'ms')) - 1]
     #exactmatch = getSPaTIndex(spatdf, ts[phaseindex]+(f[phaseindex]%10)*np.timedelta64(100,'ms'))
     rs = exactmatch['hexphase']
     cycle = exactmatch['cycle']
-    s5 = time.time()
-    nt = tH[tid]
-    if (nt != None and nt.iscent != 1):
-        updateindex = nt.x.size
-        x = np.concatenate([nt.x, x])
-        y = np.concatenate([nt.arr, y])
-        t = np.concatenate([nt.t, t])
-        ts = np.concatenate([nt.ts, ts])
-        f = np.concatenate([nt.f, f])
-        oldclus = nt.clus
-    s6 = time.time()
-    diffx = x[x.size-1]-x[0]
-    diffy = y[y.size-1]-y[0]
-    if (diffx > 10):
-        x = np.maximum.accumulate(x)
-    elif (diffx < -10):
-        x = np.minimum.accumulate(x)
-    if (diffy > 10):
-        y = np.maximum.accumulate(y)
-    elif (diffy < -10):
-        y = np.minimum.accumulate(y)
-    s7 = time.time()
-
-    rrange = 1260
-    nt = Track(tid, x, y, rrange)
-    nt.classtype = c.iloc[0]
     nt.phasetype = rs
+    nt.cycles.append(cycle)
+    if (nt.x.size <= 3 ):
+        nt.issmall = 1
+        return createTrackData(nt, updateindex, updaterows, inserttrackrows, 'small', 0)
+    if (trackStartsAndEndsBeforeStopBar(polygon, nt.x, nt.arr, isPed)):
+        nt.isoutside = 1
+        return createTrackData(nt, updateindex, updaterows, inserttrackrows, 'outside', 0)
     nt.len = getPathLength(tid, x, y)
-    nt.iid = str(iid.iloc[0])
-    nt.t = t
-    nt.ts = ts
-    nt.f = f
-    if (nt.classtype != 'pedestrian'):
-        rbit, rbit2 = getGreenBit(x, y)
-        nt.gbit = rbit
-        nt.gbit2 = rbit2
-        nt.phase = rbit
     cent = findMatchingCentroid(nt, geoclusters, centroid_list, centroids)
-    s7mid = time.time()
-    sx, sy, spindex, check = setSpeed(x, y, t, nt, cent)
-    nt.sx = sx
-    nt.sy = sy
+    sx, sy, spindex, check = setSpeed(nt.x, nt.arr, nt.t, nt, cent)
+    nt.sx = np.asarray(sx)
+    nt.sy = np.asarray(sy)
     if (check):
-        nt.isAnomalous = 1
-    if (isCurved(nt)):
-        nt.isthrough = False
+        nt.hispeed = 1
+        #return createTrackData(nt, updateindex, updaterows, inserttrackrows, 'hispeed', 0)
+    if (nt.oddshape == 1):
+        nt.oddshape = 1
+        return createTrackData(nt, updateindex, updaterows, inserttrackrows, 'shape', 0)
+    #check for the length of the track relative to the centroid; ed = euclidean diatance
+    edtrack = np.sqrt(np.add(np.square(nt.x[0]-nt.x[nt.x.size-1]), np.square(nt.arr[0]-nt.arr[nt.arr.size-1])))
+    edcentroid = np.sqrt(np.add(np.square(cent.x[0]-cent.x[cent.x.size-1]), np.square(cent.arr[0]-cent.arr[cent.arr.size-1])))
+    threshold = 0.1
+    if (edtrack/edcentroid < 0.1):
+        nt.issmall = 1
+        return createTrackData(nt, updateindex, updaterows, inserttrackrows, 'small', 0)
+
+    skipbeg, skipend, skipmid, skipangular = trimTrack(nt, cent)
+    s7mid = time.time()
     isrj = 0
     speedphase = rs
     s8 = time.time()
@@ -1141,66 +1358,18 @@ def processTrack(tid, df, spatdf, geoclusters, centroid_list, centroids, tH):
     pedindex = objects.index('pedestrian')
     s9 = time.time()
     if (cindex != pedindex):
-        rbit, rbit2 = getGreenBit(x, y)
-        nt.gbit = rbit
-        nt.gbit2 = rbit2
-        nt.phase = rbit
-        if (rbit == 0):
-            nt.phase = rbit2
-            permittedPhases = options['permittedright']
-            if str(rbit2) not in permittedPhases:
-                rbit = rbit2
-        if (rbit == 2 or rbit == 5):
-            stopbar = phase2stopbar
-        elif (rbit == 4 or rbit == 7):
-            stopbar = phase4stopbar
-        elif (rbit == 6 or rbit == 1):
-            stopbar = phase6stopbar
-        elif (rbit == 8 or rbit == 3):
-            stopbar = phase8stopbar
-        if (rbit != 0):
-            crossts = timeTrackCrossesStopBar(nt, stopbar)
-            if (crossts != 0):
-                exactmatch = spatdf.iloc[getSPaTIndex(spatdf, crossts)]
-                speedphase = exactmatch['hexphase']
-                bin_string = bin(int('1'+speedphase, 16))[3:]
-                if (bin_string[rbit+16-1] == '1'):
-                    if (rbit2 > 0):
-                        if (bin_string[rbit2+16-1] == '1'):
-                            isrj = 1
-                    else:
-                        isrj = 1
-                if (debug == 1):
-                    if (nt.tid==2359):
-                        print ('debug', rs, crossts, exactmatch, speedphase, bin_string, rbit, rbit2, bin_string[rbit2+16-1])
+        nt.isrj = checkPhaseAndMovement(nt, vehspat)
     s10 = time.time()
-    nt.isrj = isrj
     si = 0
     if (updateindex > -1):
         si = updateindex
-        if (oldclus != nt.clus):
-            pdts = pd.to_datetime(nt.ts[0])
-            tstr = pdts.strftime("%Y-%m-%d %H:%M:%S")
-            updaterow = (str(nt.phase), nt.clus, str(nt.isAnomalous), str(nt.isrj), tstr, str(tid))
-            updaterows.append(updaterow)
-            print ('update', str(nt.phase), nt.clus, str(nt.isAnomalous), str(nt.isrj), tstr, str(tid))
-            #mycursor.execute(updatequery, updaterow)
-            #myoutputdb.commit()
+        updaterow = createUpdateRow(nt, nt.clus)
+        updaterows.append(updaterow)
+        print ('update', str(nt.phase), nt.clus, str(nt.isAnomalous), str(nt.isrj), str(tid), str(nt.uid))
     s11 = time.time()
-    outputdf = pd.DataFrame()
-    outputdf['frame_id'] = f[si:ts.size-1]
-    outputdf['track_id'] = [tid] * (ts.size-1-si)
-    outputdf['center_x'] = x[si:ts.size-1]
-    outputdf['center_y'] = y[si:ts.size-1]
-    outputdf['class'] = [c.iloc[0]] * (ts.size-1-si)
-    outputdf['timestamp'] = pd.to_datetime(ts[si:ts.size-1]) + f[si:ts.size-1]%10*np.timedelta64(100,'ms')
-    outputdf['intersection_id'] = [options['cityintid']] * (ts.size-1-si)
-    outputdf['camera_id'] = [iid.iloc[0]] * (ts.size-1-si)
-    outputdf['SPAT'] = [rs] * (ts.size-1-si)
-    outputdf['cycle'] = [cycle] * (ts.size-1-si)
-    outputdf['speed_x'] = sx[si:ts.size-1]
-    outputdf['speed_y'] = sy[si:ts.size-1]
-
+    if (nt.x.size != skipbeg.size):
+        print (nt.tid, nt.x.size, skipbeg.size)
+    outputdf = createTrackFrame(nt, si, skipbeg, skipend, skipmid, skipangular)
     #for index in range(si, ts.size-1):
         #pdts = pd.to_datetime(ts[index])
         #tstr = pdts.strftime("%Y-%m-%d %H:%M:%S") + '.' + str(f[index]%10)
@@ -1210,15 +1379,301 @@ def processTrack(tid, df, spatdf, geoclusters, centroid_list, centroids, tH):
     if (updateindex == -1):
         pdts = pd.to_datetime(ts[0])
         tstr = pdts.strftime("%Y-%m-%d %H:%M:%S")
-        inserttrackrow = (options['cityintid'], str(iid.iloc[0]), tstr, str(nt.tid), str(nt.phase), nt.clus, str(nt.isAnomalous), str(nt.isrj), str(nm[0]), str(sig[0]))
+        inserttrackrow = (options['cityintid'], str(iid.iloc[0]), tstr, str(nt.tid), str(nt.phase), nt.clus, str(nt.isAnomalous), str(nt.isrj), str(nm[0]), str(sig[0]), str(nt.uid), str(nt.issmall), str(nt.isoutside), str(nt.hispeed), str(nt.oddshape))
         inserttrackrows.append(inserttrackrow)
-        print (options['cityintid'], str(iid.iloc[0]), tstr, str(nt.tid), str(nt.phase), cent.phase, nt.clus, str(nt.isAnomalous), str(nt.isrj), str(nm[0]), str(sig[0]))
+        print (options['cityintid'], str(iid.iloc[0]), tstr, str(nt.tid), str(nt.phase), cent.phase, nt.clus, str(nt.isAnomalous), str(nt.isrj), str(nm[0]), str(sig[0]), str(nt.uid), str(nt.issmall), str(nt.isoutside), str(nt.hispeed), str(nt.oddshape))
         #mysqlwb = time.time()
         #mycursor.execute(writequery, insertrow)
         #myoutputdb.commit()
     s13 = time.time()
     #print (tid, ts.size, s2-s1, s3-s2, s4-s3, s5-s4, s6-s5, s7-s6, s7mid-s7, s8-s7mid, s9-s8, s10-s9, s11-s10, s12-s11, s13-s12)
-    return updaterows, outputdf, inserttrackrows, nt
+    return updaterows, outputdf, inserttrackrows, nt, 0
+
+def createUpdateRow(nt, clus):
+    pdts = pd.to_datetime(nt.ts[0])
+    tstr = pdts.strftime("%Y-%m-%d %H:%M:%S")
+    updaterow = (str(nt.phase), clus, str(nt.isAnomalous), str(nt.isrj), str(nt.issmall), str(nt.isoutside), str(nt.hispeed), str(nt.oddshape), tstr, str(nt.tid), str(nt.uid))
+    return updaterow
+
+def createTrackFrame(nt, si, skipbeg, skipend, skipmid, skipangular):
+    outputdf = pd.DataFrame()
+    outputdf['frame_id'] = nt.f[si:nt.ts.size]
+    outputdf['track_id'] = [nt.tid] * (nt.ts.size-si)
+    outputdf['center_x'] = nt.x[si:nt.ts.size]
+    outputdf['center_y'] = nt.arr[si:nt.ts.size]
+    outputdf['class'] = [nt.classtype] * (nt.ts.size-si)
+    outputdf['timestamp'] = pd.to_datetime(nt.ts[si:nt.ts.size]) + nt.f[si:nt.ts.size]%10*np.timedelta64(100,'ms')
+    outputdf['intersection_id'] = [options['cityintid']] * (nt.ts.size-si)
+    outputdf['camera_id'] = [nt.iid] * (nt.ts.size-si)
+    outputdf['SPAT'] = [nt.phasetype] * (nt.ts.size-si)
+    if (len(nt.cycles) > 0):
+        outputdf['cycle'] = [nt.cycles[0]] * (nt.ts.size-si)
+    else:
+        outputdf['cycle'] = [0] * (nt.ts.size-si)
+    outputdf['speed_x'] = nt.sx[si:nt.ts.size]
+    outputdf['speed_y'] = nt.sy[si:nt.ts.size]
+    outputdf['unique_ID'] = [nt.uid] * (nt.ts.size-si)
+    outputdf['skip_begin'] = skipbeg[si:nt.ts.size]
+    outputdf['skip_end'] = skipend[si:nt.ts.size]
+    outputdf['skip_mid'] = skipmid[si:nt.ts.size]
+    outputdf['skip_angle'] = skipangular[si:nt.ts.size]
+    outputdf['raw_x'] = nt.origx
+    outputdf['raw_y'] = nt.origy
+    print (outputdf)
+    #outputdf = pd.DataFrame()
+    #outputdf['frame_id'] = nt.f[si:nt.ts.size-1]
+    #outputdf['track_id'] = [tid] * (nt.ts.size-1-si)
+    #outputdf['center_x'] = nt.x[si:nt.ts.size-1]
+    #outputdf['center_y'] = nt.arr[si:nt.ts.size-1]
+    #outputdf['class'] = [c] * (nt.ts.size-1-si)
+    #outputdf['timestamp'] = pd.to_datetime(nt.ts[si:nt.ts.size-1]) + nt.f[si:nt.ts.size-1]%10*np.timedelta64(100,'ms')
+    #outputdf['intersection_id'] = [options['cityintid']] * (nt.ts.size-1-si)
+    #outputdf['camera_id'] = [iid] * (nt.ts.size-1-si)
+    #outputdf['SPAT'] = [rs] * (nt.ts.size-1-si)
+    #outputdf['cycle'] = [cycle] * (nt.ts.size-1-si)
+    #outputdf['speed_x'] = nt.sx[si:nt.ts.size-1]
+    #outputdf['speed_y'] = nt.sy[si:nt.ts.size-1]
+    #outputdf['unique_ID'] = [nt.uid] * (nt.ts.size-1-si)
+    #outputdf['skipBegin'] = [0] * (nt.ts.size-1-si)
+    #outputdf['skipEnd'] = [0] * (nt.ts.size-1-si)
+    #outputdf['skipMiddle'] = [0] * (nt.ts.size-1-si)
+    #outputdf['medFilter'] = [0] * (nt.ts.size-1-si)
+    return outputdf
+
+#def createDummyTrack(tH, tid, si, uid, x, y, origx, origy, issmall, isoutside, classtype, iid, t, ts, f, rs, cycle, ranget, updaterows, inserttrackrows, nm, sig, clusname, ignore):
+#    skipbeg = np.zeros((x.size,), dtype=int)
+#    skipend = np.zeros((x.size,), dtype=int)
+#    skipmid = np.zeros((x.size,), dtype=int)
+#    skipangular = np.zeros((x.size,), dtype=int)
+#    if (si != -1):
+#        nt = tH[tid]
+#        outputdf = createTrackFrame(nt, si, skipbeg, skipend, skipmid, skipangular)
+#        updaterow = createUpdateRow(nt, clusname)
+#        updaterows.append(updaterow)
+#        return updaterows, outputdf, inserttrackrows, nt, 0
+#    nt = Track(tid, uid, x, y, origx, origy, t, ts, f, iid, classtype, ranget)
+#    nt.clus = clusname
+#    nt.isAnomalous = 1
+#    nt.sx = [0] * x.size
+#    nt.sy = [0] * x.size
+#    nt.origx = origx
+#    nt.origy = origy
+#    nt.issmall = 1
+#    nt.isoutside = 1
+#    pdts = pd.to_datetime(nt.ts[0])
+#    tstr = pdts.strftime("%Y-%m-%d %H:%M:%S")
+#    outputdf = createTrackFrame(nt, 0, skipbeg, skipend, skipmid, skipangular)
+#    inserttrackrow = (options['cityintid'], str(iid), tstr, str(nt.tid), str(nt.phase), nt.clus, str(nt.isAnomalous), str(nt.isrj), str(nm), str(sig), str(nt.uid), str(nt.issmall), str(nt.isoutside), str(nt.hispeed), str(nt.oddshape))
+#    inserttrackrows.append(inserttrackrow)
+#    return updaterows, outputdf, inserttrackrows, nt, ignore
+
+def createTrackData(nt, si, updaterows, inserttrackrows, clusname, ignore):
+    skipbeg = np.zeros((nt.x.size,), dtype=int)
+    skipend = np.zeros((nt.x.size,), dtype=int)
+    skipmid = np.zeros((nt.x.size,), dtype=int)
+    skipangular = np.zeros((nt.x.size,), dtype=int)
+    nt.isAnomalous = 1
+    nt.clus = clusname
+    if (si != -1):
+        outputdf = createTrackFrame(nt, si, skipbeg, skipend, skipmid, skipangular)
+        updaterow = createUpdateRow(nt, clusname)
+        updaterows.append(updaterow)
+        return updaterows, outputdf, inserttrackrows, nt, 0
+    pdts = pd.to_datetime(nt.ts[0])
+    tstr = pdts.strftime("%Y-%m-%d %H:%M:%S")
+    outputdf = createTrackFrame(nt, 0, skipbeg, skipend, skipmid, skipangular)
+    inserttrackrow = (options['cityintid'], str(nt.iid), tstr, str(nt.tid), str(nt.phase), nt.clus, str(nt.isAnomalous), str(nt.isrj), str(nt.nm), str(nt.sig), str(nt.uid), str(nt.issmall), str(nt.isoutside), str(nt.hispeed), str(nt.oddshape))
+    inserttrackrows.append(inserttrackrow)
+    return updaterows, outputdf, inserttrackrows, nt, 0
+
+def checkPhaseAndMovement(nt, spatdf):
+    x = nt.x
+    y = nt.arr
+    isrj = 0
+    rbit, rbit2 = getGreenBit(x, y)
+    nt.gbit = rbit
+    nt.gbit2 = rbit2
+    if (rbit == 0):
+        #nt.phase = rbit2
+        permittedPhases = options['permittedright']
+        if str(rbit2) not in permittedPhases:
+            rbit = rbit2
+    if (rbit == 2 or rbit == 5):
+        stopbar = phase2stopbar
+    elif (rbit == 4 or rbit == 7):
+        stopbar = phase4stopbar
+    elif (rbit == 6 or rbit == 1):
+        stopbar = phase6stopbar
+    elif (rbit == 8 or rbit == 3):
+        stopbar = phase8stopbar
+    if (rbit != 0):
+        crossts = timeTrackCrossesStopBar(nt, stopbar)
+        if (crossts != 0):
+            exactmatch = spatdf.iloc[getSPaTIndex(spatdf, crossts)]
+            speedphase = exactmatch['hexphase']
+            bin_string = bin(int('1'+speedphase, 16))[3:]
+            if (bin_string[rbit+16-1] == '1'):
+                if (rbit2 > 0):
+                    if (bin_string[rbit2+16-1] == '1'):
+                        isrj = 1
+                else:
+                    isrj = 1
+            #if (debug == 1):
+                #if (nt.tid==2359):
+                    #print ('debug', rs, crossts, exactmatch, speedphase, bin_string, rbit, rbit2, bin_string[rbit2+16-1])
+    return isrj
+
+def angle(dir):
+    """
+    Returns the angles between vectors.
+
+    Parameters:
+    dir is a 2D-array of shape (N,M) representing N vectors in M-dimensional space.
+
+    The return value is a 1D-array of values of shape (N-1,), with each value
+    between 0 and pi.
+
+    0 implies the vectors point in the same direction
+    pi/2 implies the vectors are orthogonal
+    pi implies the vectors point in opposite directions
+    """
+    dir2 = dir[1:]
+    dir1 = dir[:-1]
+    return np.arccos((dir1*dir2).sum(axis=1)/(
+        np.sqrt((dir1**2).sum(axis=1)*(dir2**2).sum(axis=1))))
+
+def trimTrack(track, centroid):
+    mask = np.ones((track.x.size,), dtype=int)
+    skipbeg = np.zeros((track.x.size,), dtype=int)
+    skipmid = np.zeros((track.x.size,), dtype=int)
+    skipend = np.zeros((track.x.size,), dtype=int)
+    skipangular = np.zeros((track.x.size,), dtype=int)
+    ntpair = [[x, y] for x, y in zip(track.x, track.arr)]
+    nt1pair = [[x, y] for x, y in zip(centroid.x, centroid.arr)]
+    dist, path = fastdtw(ntpair, nt1pair, dist=euclidean)
+    first = 1
+    count = 0
+    found = 0
+    prevpair = path[0]
+    for pair in path[1:]:
+        if (pair[0] != prevpair[0] and (pair[1] == prevpair[1]) and pair[1] != centroid.x.size-1):
+            mask[prevpair[0]] = 0
+        #if centroid track coordinate is 0 and actual track coordinate is > 0, mark skipbeg index
+        if (prevpair[1] == 0 and pair[0] > 0):
+            skipbeg[prevpair[0]] = 1
+        #else if centroid track coordinate is the last one for two consecutive entries, mark the skipend index
+        elif (prevpair[1] == pair[1]):
+            skipend[pair[0]] = 1
+        elif (pair[1] == prevpair[1]):
+            skipmed[prevpair[0]] = 1
+        prevpair = pair
+
+    if (track.tid==1484):
+        print (1484, path)
+        print (mask)
+        print (track.arr)
+    modx = track.x[np.where(mask)]
+    mody = track.arr[np.where(mask)]
+    if (track.tid==1484):
+        print (track.arr)
+        print (track.x)
+    tolerance = 20
+    origxy = [[x, y] for x, y in zip(track.x, track.arr)]
+    xy = [[x, y] for x, y in zip(modx, mody)]
+    simplified = np.array(rdp(xy, tolerance))
+    min_angle = np.pi*0.35
+    directions = np.diff(simplified, axis=0)
+    theta = angle(directions)
+    idx = np.where(theta>min_angle)[0]+1
+    if (track.tid == 1484):
+        print (simplified)
+        print (min_angle, idx, theta)
+    if (idx.any()):
+        coord = simplified[idx[[idx.size-1]]]
+        print (coord)
+        midx = np.argwhere(np.all(origxy == coord, axis=1))[0]
+        skipangular = np.zeros((track.x.size,), dtype=int)
+        skipangular[:midx[0]] = 1
+        if (track.tid==1484):
+            print (mask)
+            print (track.arr)
+            print (track.x)
+        
+    return skipbeg, skipend, skipmid, skipangular
+
+def trimTrack2(track, centroid):
+    mask = np.ones((track.x.size,), dtype=int)
+    skipbeg = np.zeros((track.x.size,), dtype=int)
+    skipmid = np.zeros((track.x.size,), dtype=int)
+    skipend = np.zeros((track.x.size,), dtype=int)
+    skipangular = np.ones((track.x.size,), dtype=int)
+    ntpair = [[x, y] for x, y in zip(track.x, track.arr)]
+    nt1pair = [[x, y] for x, y in zip(centroid.x, centroid.arr)]
+    dist, path = fastdtw(ntpair, nt1pair, dist=euclidean)
+    first = 1
+    count = 0
+    found = 0
+    for pair in path:
+        if (first):
+            first = 0
+        elif (pair[0] != prevpair[0] and (pair[1] == prevpair[1]) and pair[1] != centroid.x.size-1):
+            mask[prevpair[0]] = 0
+        #if centroid track coordinate is 0 and actual track coordinate is > 0, mark skipbeg index
+        if (prevpair[1] == 0 and pair[0] > 0):
+            skipbeg[prevpair[0]] = 1
+        #else if centroid track coordinate is the last one for two consecutive entries, mark the skipend index
+        elif (prevpair[1] == pair[1]):
+            skipend[pair[0]] = 1
+        elif (pair[1] == prevpair[1]):
+            skipmed[prevpair[0]] = 1
+        prevpair = pair
+
+    if (track.tid==1484):
+        print (1484, path)
+        print (mask)
+        print (track.arr)
+    track.x = track.x[np.where(mask)]
+    track.arr = track.arr[np.where(mask)]
+    track.t = track.t[np.where(mask)]
+    track.ts = track.ts[np.where(mask)]
+    track.f = track.f[np.where(mask)]
+    #track.sx = track.sx[np.where(mask)] #commented out because speed is set later
+    #track.sy = track.sy[np.where(mask)]
+    track.x = sp.signal.medfilt(track.x, 3)
+    track.arr = sp.signal.medfilt(track.arr, 3)
+    #track.cycles = track.cycles[np.where(mask)]
+    if (track.tid==1484):
+        print (track.arr)
+        print (track.x)
+    tolerance = 20
+    xy = [[x, y] for x, y in zip(track.x, track.arr)]
+    simplified = np.array(rdp(xy, tolerance))
+    min_angle = np.pi*0.35
+    directions = np.diff(simplified, axis=0)
+    theta = angle(directions)
+    idx = np.where(theta>min_angle)[0]+1
+    if (track.tid == 1484):
+        print (simplified)
+        print (min_angle, idx, theta)
+    if (idx.any()):
+        coord = simplified[idx[[idx.size-1]]]
+        print (coord)
+        midx = np.argwhere(np.all(xy == coord, axis=1))[0]
+        mask = np.ones((track.x.size,), dtype=int)
+        mask[:midx[0]] = 0
+        track.x = track.x[np.where(mask)]
+        track.arr = track.arr[np.where(mask)]
+        track.t = track.t[np.where(mask)]
+        track.ts = track.ts[np.where(mask)]
+        track.f = track.f[np.where(mask)]
+        track.sx = track.sx[np.where(mask)]
+        track.sy = track.sy[np.where(mask)]
+        if (track.tid==1484):
+            print (mask)
+            print (track.arr)
+            print (track.x)
+        
+    return skipbeg, skipend, skipmid, skipangular
 
 def readCentroidData(myoutputdb):
     geoClusters = [[[] for j in range(len(hlines))] for i in range(len(vlines))]
@@ -1236,20 +1691,18 @@ def readCentroidData(myoutputdb):
         r = np.size(x)
         cindex = objects.index(c[0])
         r = np.size(x)
-        nt = Track(tid, x, y, 0)
+        nt = Track(tid, 0, x, y, x, y, 0, 0, 0, iid[0], c[0], 0, 0, -1)
         nt.start = 0
         nt.end = x.size
-        nt.classtype = c[0]
         nt.phasetype = ps[r-2]
         nt.len = getPathLength(tid, x, y)
-        nt.iid = iid[0]
         nt.iscent = 1
         if (c[0] != 'pedestrian'):
-            rbit, rbit2 = getGreenBit(x, y)
-            tracksH[tid] = nt
-            nt.gbit = rbit
-            nt.gbit2 = rbit2
-            nt.phase = rbit
+            #rbit, rbit2 = getGreenBit(x, y)
+            #tracksH[tid] = nt
+            #nt.gbit = rbit
+            #nt.gbit2 = rbit2
+            nt.phase = int(ps[0])
         finalCentroids.append(nt)
         finalCentroidName.append(name[0])
         if (isCurved(nt)):
@@ -1269,12 +1722,12 @@ def main():
     myoutputdb = pymysql.connect(host=options['host'], user=options['user'], passwd=options['passwd'], db=options['testdb'], port=int(options['port']))
     mycursor = myoutputdb.cursor()
 
-    writespat='insert into OnlineSPaT(intersection_id, camera_id, timestamp, hexphase, cycle, city, state) values (%s, %s, %s, %s, %s, %s, %s);'
-    writequery='insert into OnlineDisplayInfo (frame_id, track_id, center_x, center_y, class, timestamp, intersection_id, camera_id, SPAT, Cycle, speed_x, speed_y) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);'
-    writetrackquery='insert into TrackProperties (intersection_id, camera_id, timestamp, track_id, phase, cluster, isAnomalous, redJump, nearmiss, signature) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);'
-    updatetrackquery='update TrackProperties set phase=%s, cluster=%s, isAnomalous=%s, redJump=%s where timestamp=%s and track_id=%s;'
+    writespat='insert into OnlineSPaT(intersection_id, camera_id, timestamp, hexphase, cycle, city, state, type) values (%s, %s, %s, %s, %s, %s, %s, %s);'
+    writequery='insert into RealDisplayInfo (frame_id, track_id, center_x, center_y, class, timestamp, intersection_id, camera_id, SPAT, Cycle, speed_x, speed_y, unique_ID, skip_begin, skip_end, skip_mid, skip_angle, raw_x, raw_y) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);'
+    writetrackquery='insert into RealTrackProperties (intersection_id, camera_id, timestamp, track_id, phase, cluster, isAnomalous, redJump, nearmiss, signature, unique_ID, small, outside, hispeed, oddshape) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);'
+    updatetrackquery='update RealTrackProperties set phase=%s, cluster=%s, isAnomalous=%s, redJump=%s, small=%s, outside=%s, hispeed=%s, oddshape=%s where timestamp=%s and track_id=%s and unique_ID=%s;'
     query = 'select * from testATSPM where timestamp between %(name)s and %(name2)s and intersection_id=%(name3)s;'
-    spatquery = 'select timestamp,hexphase,cycle from OnlineSPaT where timestamp between %(name2)s and %(name3)s and intersection_id=%(name)s;'
+    spatquery = 'select timestamp,hexphase,cycle,type from OnlineSPaT where timestamp between %(name2)s and %(name3)s and intersection_id=%(name)s;'
 
     cindex = 4
     phases = []
@@ -1288,24 +1741,22 @@ def main():
     etime = pd.to_datetime(options['end'])
     intersection_num = int(options['cameraid'])
     #query = 'select time,frame_id,track_id,center_x,center_y,class,timestamp,intersection_id,nearmiss,signature from OnlineTrackInfo where ID <= %(name)s and intersection_id=6 and timestamp > %(name2)s;'
-    querylimit = 'select time,frame_id,track_id,center_x,center_y,class,timestamp,intersection_id,nearmiss,signature from OnlineTrackInfo where timestamp between %(name2)s and %(name3)s and intersection_id=%(name)s;'
-    df = pd.read_sql(querylimit, myinputdb, params={'name' : str(intersection_num), 'name2' : stime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : ftime.strftime("%Y-%m-%d %H:%M:%S.%f")})
-    tracks = df['track_id'].unique()
-    ts = df.loc[0][6] #change later to now = datetime.now()f
-    #ets = df.tail(1)[6]
+    querylimit = 'select time,frame_id,track_id,center_x,center_y,class,timestamp,intersection_id,nearmiss,signature,unique_ID from OnlineTrackInfo where timestamp between %(name2)s and %(name3)s and intersection_id=%(name)s;'
+    videodf = pd.read_sql(querylimit, myinputdb, params={'name' : str(int(options['videocameraid'])), 'name2' : stime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : ftime.strftime("%Y-%m-%d %H:%M:%S.%f")})
+    tracks = videodf['track_id'].unique()
+    ts = videodf.loc[0][6] #change later to now = datetime.now()f
+    #ets = videodf.tail(1)[6]
     currentTime = pd.to_datetime(ts) #, format = '%m/%d/%y %H:%M:%S.%f')
     startTime = pd.to_datetime(stime) - datetime.timedelta(minutes=15)
     sdf = pd.read_sql(query, myoutputdb, params={'name': startTime.strftime("%Y-%m-%d %H:%M:%S"), 'name2' : ftime.strftime("%Y-%m-%d %H:%M:%S"), 'name3' : options['cityintid']})
     spatrows = convertToSPaT(sdf, startTime)
     mycursor.executemany(writespat, spatrows)
     myoutputdb.commit()
-    df = pd.read_sql(querylimit, myinputdb, params={'name' : str(intersection_num), 'name2' : stime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : ftime.strftime("%Y-%m-%d %H:%M:%S.%f")})
-    spatdf = pd.DataFrame(spatrows, columns =['intersection_id', 'camera_id', 'timestamp', 'hexphase', 'cycle', 'city', 'state'])
+    videodf = pd.read_sql(querylimit, myinputdb, params={'name' : str(int(options['videocameraid'])), 'name2' : stime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : ftime.strftime("%Y-%m-%d %H:%M:%S.%f")})
+    spatdf = pd.DataFrame(spatrows, columns =['intersection_id', 'camera_id', 'timestamp', 'hexphase', 'cycle', 'city', 'state','type'])
     spatdf['timestamp'] = pd.to_datetime(spatdf['timestamp'])
-    #spatdf = pd.read_sql(spatquery, myoutputdb, params={'name' : options['cityintid'], 'name2' : startTime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : ftime.strftime("%Y-%m-%d %H:%M:%S.%f")})
-    #spatdf['timestamp'] = pd.to_datetime(spatdf['timestamp'])
     spatdf['timestamp'] = spatdf['timestamp'].dt.round('100ms')
-    tracks = df['track_id'].unique()
+    tracks = videodf['track_id'].unique()
     recs = 0
     updaterows = []
     insertrows = []
@@ -1331,16 +1782,17 @@ def main():
         myimpl = time.time()
         with mp.Pool(10) as pool:
             for tid in tracks:
-                results.append(pool.apply_async(processTrack, args=(tid, df, spatdf, geoClusters, finalCentroidName, finalCentroids, tracksH)))
-                #updaterows, outputdf, inserttrackrows, nt = processTrack(tid, df, spatdf, geoClusters, finalCentroidName, finalCentroids, tracksH)
-                #tracksH[tid] = nt
+                results.append(pool.apply_async(processTrack, args=(tid, videodf, spatdf, geoClusters, finalCentroidName, finalCentroids, tracksH)))
+                #updaterows, outputdf, inserttrackrows, nt, ignore = processTrack(tid, videodf, spatdf, geoClusters, finalCentroidName, finalCentroids, tracksH)
+                #if (ignore == 0):
+                    #tracksH[tid] = nt
             prevstime = stime
             prevftime = ftime
             prevspatdf = spatdf
             stime = ftime + step
             ftime = stime + minstep
             mysqldfread = time.time()
-            df = pd.read_sql(querylimit, myinputdb, params={'name' : str(intersection_num), 'name2' : stime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : ftime.strftime("%Y-%m-%d %H:%M:%S.%f")})
+            videodf = pd.read_sql(querylimit, myinputdb, params={'name' : str(int(options['videocameraid'])), 'name2' : stime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : ftime.strftime("%Y-%m-%d %H:%M:%S.%f")})
             mysqldfreaddone = time.time()
             mysqlsdfread = time.time()
             sdf = pd.read_sql(query, myoutputdb, params={'name': stime.strftime("%Y-%m-%d %H:%M:%S"), 'name2' : ftime.strftime("%Y-%m-%d %H:%M:%S"), 'name3' : options['cityintid']})
@@ -1353,8 +1805,8 @@ def main():
                 mycursor.executemany(writespat, spatrows)
                 mytimespatwrite =  time.time()
                 startTime = ftime - datetime.timedelta(minutes=10)
-                spatdf = pd.DataFrame(spatrows, columns =['intersection_id', 'camera_id', 'timestamp', 'hexphase', 'cycle', 'city', 'state'])
-                spatdf['timestamp'] = pd.to_datetime(spatdf['timestamp'])
+                #spatdf = pd.DataFrame(spatrows, columns =['intersection_id', 'camera_id', 'timestamp', 'hexphase', 'cycle', 'city', 'state', 'type'])
+                #spatdf['timestamp'] = pd.to_datetime(spatdf['timestamp'])
             mytimespatread = time.time()
             spatdf = pd.read_sql(spatquery, myoutputdb, params={'name' : options['cityintid'], 'name2' : startTime.strftime("%Y-%m-%d %H:%M:%S.%f"), 'name3' : ftime.strftime("%Y-%m-%d %H:%M:%S.%f")})
             mytimespatreaddone = time.time()
@@ -1369,16 +1821,22 @@ def main():
         mypropcopy = time.time()
         for i in range(0, len(tracks)):
             gotresults = results[i].get()
-            updaterows.extend(gotresults[0])
-            outputdf = outputdf.append(gotresults[1])
-            inserttrackrows.extend(gotresults[2])
-            tracksH[tracks[i]] = gotresults[3]
+            ignore = gotresults[4]
+            if (ignore == 0):
+                updaterows.extend(gotresults[0])
+                outputdf = outputdf.append(gotresults[1])
+                inserttrackrows.extend(gotresults[2])
+                tracksH[tracks[i]] = gotresults[3]
+        #print (outputdf)
+        outputdf = outputdf.astype({"unique_ID":'int64'})
         mypropcopydone = time.time()
         mysqlws = time.time()
         outputdf.sort_values(by='frame_id')
-        outputdf.to_sql('OnlineDisplayInfo', con=engine, if_exists='append', index = False)
+        outputdf.to_sql('RealDisplayInfo', con=engine, if_exists='append', index = False)
         outputdf = outputdf.iloc[0:0]
         mycursor.executemany(updatetrackquery, updaterows)
+        #print ('Here are the insert rows')
+        print (inserttrackrows)
         mycursor.executemany(writetrackquery, inserttrackrows)
         mysqlwb = time.time()
         myoutputdb.commit()
@@ -1399,9 +1857,10 @@ def main():
                 threshtime = tenseconds
                 for tid in tracks:
                     nt = tracksH[tid]
-                    ts = staticTrackCrossesStopBar(nt, stopbar, sigtime)
-                    if (ts != 0 and ts > lowthresh and ts < highthresh):
-                        phase2vehiclets.append(ts)
+                    if (nt != None):
+                        ts = staticTrackCrossesStopBar(nt, stopbar, sigtime)
+                        if (ts != 0 and ts > lowthresh and ts < highthresh):
+                            phase2vehiclets.append(ts)
                 if (phase2vehiclets):
                     phase2vehiclets.sort()
                     lowestts = pd.to_datetime(phase2vehiclets[0])
@@ -1409,8 +1868,8 @@ def main():
                     print ('offset is', offset)
                     wait = datetime.timedelta(seconds=0)
                 phase2vehiclets.clear()
-        df.timestamp = df.timestamp + offset
-        tracks = df['track_id'].unique()
+        videodf.timestamp = videodf.timestamp + offset
+        tracks = videodf['track_id'].unique()
         end = time.time()
         print (end-myimpl)
 #
@@ -1420,7 +1879,8 @@ def main():
 def getPhase2Signal(stime, ftime, spatdf):
     status = False
     ts = 0
-    df = spatdf[spatdf['timestamp'] >= stime]
+    vehspat = spatdf[spatdf['type'] == 1]
+    df = vehspat[vehspat['timestamp'] >= stime]
     mask = df.hexphase.str[0] == '4'
     pos = np.flatnonzero(mask)
     if (pos.size != 0):
@@ -1470,7 +1930,7 @@ def timeTrackCrossesStopBar(nt, stopbar): #the car must have arrived before the 
 
 def staticTrackCrossesStopBar(nt, stopbar, stime): #the car must have arrived before the signal turned green which is checked by speed and a comparison with stime
     ts = 0
-    if ((nt.gbit == 2 or nt.gbit == 5) and pd.to_datetime(nt.ts[0]) < stime):
+    if ((nt.phase == 2 or nt.phase == 5) and pd.to_datetime(nt.ts[0]) < stime):
         if (nt.x.size < 10):
             return ts
         sp = np.asarray([[x, y] for x, y in zip(nt.sx, nt.sy)])
@@ -1556,6 +2016,8 @@ def isInDifferentCell(x, y, v, h):
     return status
 
 def findMatchingCentroid(track, geoclusters, centroid_list, centroids):
+    if (len(centroids) == 0):
+        return track
     x = track.x
     y = track.arr
     xlen = x.size
@@ -1566,44 +2028,71 @@ def findMatchingCentroid(track, geoclusters, centroid_list, centroids):
     prevy = 0
     prevv = -1
     prevh = -1
-    while (i < xlen-1):
-        if ((prevx != int(x[i]) or prevy != int(y[i])) and np.sqrt(np.square(x[i]-prevx) + np.square(y[i]-prevy)) > 20):
-            #if (prevv == -1 or prevh == -1 or isInDifferentCell(x[i], y[i], prevv, prevh)):
-            v, h = locatePointOnGrid(x[i], y[i])
-            #print (track.tid, x[i], y[i], v, h, len(vlines)/2, len(hlines)/2, vlines[v], hlines[h], prevx, prevy, np.sqrt(np.square(x[i]-prevx) + np.square(y[i]-prevy)))
-            prevv = v
-            prevh = h
-            clist.extend(geoclusters[v][h])
-            prevx = int(x[i])
-            prevy = int(y[i])
-        i = i+1
-    cset = set(clist)
+#    while (i < xlen-1):
+#        if ((prevx != int(x[i]) or prevy != int(y[i])) and np.sqrt(np.square(x[i]-prevx) + np.square(y[i]-prevy)) > 20):
+#            #if (prevv == -1 or prevh == -1 or isInDifferentCell(x[i], y[i], prevv, prevh)):
+#            v, h = locatePointOnGrid(x[i], y[i])
+#            #print (track.tid, x[i], y[i], v, h, len(vlines)/2, len(hlines)/2, vlines[v], hlines[h], prevx, prevy, np.sqrt(np.square(x[i]-prevx) + np.square(y[i]-prevy)))
+#            prevv = v
+#            prevh = h
+#            clist.extend(geoclusters[v][h])
+#            prevx = int(x[i])
+#            prevy = int(y[i])
+#        i = i+1
+#    cset = set(clist)
     found = 0
     mindist = 500
     mincent = ''
     min_centroid_track = centroids[0]
+    distace_thresh = 30
+    first_thresh = 19
+    last_threah = 19
+    if (isCurved(track)):
+        track.isthrough = False
+        distace_thresh = 39
+        first_thresh = 20
+        last_threah = 22
+    if (track.classtype == 'pedestrian'):
+        distace_thresh = 50
+        first_thresh = 30
+        last_thresh = 30
+    minimax = 0
     for cent in cset:
         isPed = 0
         idx = centroid_list.index(cent)
         centroid_track = centroids[idx]
         #if (track.gbit == centroid_track.gbit and track.gbit2 == centroid_track.gbit2):
-        isRelated, dist = closeToMembers(track, centroid_track, isPed)
-        if (isRelated):
-            found = 1
-            if (dist < mindist):
-                mindist = dist
-                mincent = cent
-                #idx = centroid_list.index(cent)
-                #centroid_track = centroids[idx]
-                min_centroid_track = centroid_track
+        if (centroid_track.classtype == track.classtype): # and centroid_track.phase == track.phase):
+            #isRelated, dist = closeToMembers(track, centroid_track, isPed)
+            tdist, maxdiff, dist, lenratio, firstdiff, lastdiff = distance(track, centroid_track, 200)
+            tdist1, maxdiff1, dist, lenratio, firstdiff1, lastdiff1 = distance(centroid_track, track, 200)
+            (d, f, l) = ((tdist+tdist1)/2, min(firstdiff, firstdiff1), min(lastdiff, lastdiff1))
+            print ("Centroid determination:", track.tid, cent, d, f, l, min(maxdiff,maxdiff1))
+            if (d < distace_thresh and f < first_thresh and l < last_threah):
+                found = 1
+                if (d < mindist):
+                    mindist = d
+                    mincent = cent
+                    idx = centroid_list.index(cent)
+                    centroid_track = centroids[idx]
+                    min_centroid_track = centroid_track
+                    minimax = min(maxdiff,maxdiff1)
     if (found == 0):
         #print ('match_result', track.tid, 'anomalous')
         track.isAnomalous = 1
-        track.clus ="anom"
+        track.clus ="shape"
+        track.oddshape = 1
     else:
         #print ('match_result', track.tid, mincent[6:], track.phasetype, mincent)
         track.clus = mincent
+        track.phase = min_centroid_track.phase
+        if (track.phase > 8):
+            track.phase = 2*(track.phase-8)
 
+    text = track.clus
+    if (minimax > 70):
+        text = "convert to shape"
+    print ("Final Centroid determination:", track.tid, track.clus, track.isthrough, text)
     return min_centroid_track
 if __name__=="__main__":
         main()
